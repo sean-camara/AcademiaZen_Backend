@@ -15,7 +15,7 @@ const webpush = require('web-push');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware - Allow multiple origins for development
+// Middleware - Allow multiple origins including Vercel preview URLs
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:5173',
@@ -28,9 +28,18 @@ app.use(cors({
   origin: function(origin, callback) {
     // Allow requests with no origin (like mobile apps or curl)
     if (!origin) return callback(null, true);
+    
+    // Check if origin is in allowed list
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
+    
+    // Allow all Vercel preview/production URLs
+    if (origin && (origin.includes('.vercel.app') || origin.includes('vercel.app'))) {
+      return callback(null, true);
+    }
+    
+    console.log('CORS blocked origin:', origin);
     return callback(null, false);
   },
   credentials: true
