@@ -256,6 +256,77 @@ app.post('/api/schedule-notification', (req, res) => {
 });
 
 /**
+ * POST /api/notify-new-task
+ * Send immediate notification when a new task is added that's due within 3 days
+ * Body: { task: { id, title, dueDate }, subscriptionEndpoint: string }
+ */
+app.post('/api/notify-new-task', async (req, res) => {
+  const { task, subscriptionEndpoint } = req.body;
+
+  if (!task || !subscriptionEndpoint || !task.dueDate) {
+    return res.status(400).json({ error: 'Task with dueDate and subscriptionEndpoint are required' });
+  }
+
+  const subscription = subscriptions.get(subscriptionEndpoint);
+  if (!subscription) {
+    return res.status(404).json({ error: 'Subscription not found' });
+  }
+
+  const now = new Date();
+  const dueDate = new Date(task.dueDate);
+  const threeDaysFromNow = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+
+  // Only notify if task is due within 3 days
+  if (dueDate > now && dueDate <= threeDaysFromNow) {
+    const hoursUntilDue = Math.round((dueDate - now) / (1000 * 60 * 60));
+    const daysUntilDue = Math.round(hoursUntilDue / 24);
+
+    let urgencyEmoji = '📋';
+    let timeText = '';
+
+    if (hoursUntilDue <= 24) {
+      urgencyEmoji = '🚨';
+      timeText = hoursUntilDue <= 1 ? 'in less than an hour!' : `in ${hoursUntilDue} hours!`;
+    } else if (daysUntilDue <= 1) {
+      urgencyEmoji = '⚠️';
+      timeText = 'tomorrow!';
+    } else if (daysUntilDue <= 2) {
+      urgencyEmoji = '⏰';
+      timeText = `in ${daysUntilDue} days`;
+    } else {
+      urgencyEmoji = '📅';
+      timeText = `in ${daysUntilDue} days`;
+    }
+
+    const payload = JSON.stringify({
+      title: `${urgencyEmoji} New Task Added`,
+      body: `"${task.title}" is due ${timeText}`,
+      icon: '/icons/icon-192x192.svg',
+      badge: '/icons/icon-72x72.svg',
+      url: '/?page=home',
+      tag: `new-task-${task.id}`,
+      data: { taskId: task.id }
+    });
+
+    try {
+      await webpush.sendNotification(subscription, payload);
+      console.log(`📤 Immediate notification sent for new task: "${task.title}" (due ${timeText})`);
+      return res.json({ success: true, message: 'Notification sent', dueIn: timeText });
+    } catch (error) {
+      if (error.statusCode === 410) {
+        subscriptions.delete(subscriptionEndpoint);
+        userTasks.delete(subscriptionEndpoint);
+        return res.status(410).json({ error: 'Subscription expired' });
+      }
+      console.error(`❌ Failed to send immediate notification: ${error.message}`);
+      return res.status(500).json({ error: 'Failed to send notification' });
+    }
+  }
+
+  res.json({ success: true, message: 'Task not within 3-day window, no immediate notification' });
+});
+
+/**
  * POST /api/sync-tasks
  * Sync user's tasks for deadline reminders
  * Body: { tasks: [{ id, title, dueDate, completed }], subscriptionEndpoint: string }
@@ -376,6 +447,7 @@ app.listen(PORT, () => {
   console.log(`   DELETE /api/unsubscribe       - Remove subscription`);
   console.log(`   POST /api/send-notification   - Send notification`);
   console.log(`   POST /api/schedule-notification - Schedule notification`);
+  console.log(`   POST /api/notify-new-task     - Immediate notification for new task`);
   console.log(`   POST /api/sync-tasks          - Sync tasks for reminders`);
   console.log(`   GET  /api/subscriptions/count - Get subscriber count`);
   console.log(`\n⏰ Task deadline reminders: Every 2 hours for tasks due within 3 days\n`);
