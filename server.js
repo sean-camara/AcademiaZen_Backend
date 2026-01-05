@@ -38,8 +38,10 @@ app.use(cors({
 app.use(express.json());
 
 // In-memory store for subscriptions (use a database in production)
-// Structure: { oderId: subscription }
 const subscriptions = new Map();
+
+// In-memory store for tasks with due dates (use a database in production)
+const userTasks = new Map(); // { oderId/endpoint: [{ id, title, dueDate }] }
 
 // Validate VAPID keys
 if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
@@ -245,6 +247,26 @@ app.post('/api/schedule-notification', (req, res) => {
 });
 
 /**
+ * POST /api/sync-tasks
+ * Sync user's tasks for deadline reminders
+ * Body: { tasks: [{ id, title, dueDate, completed }], subscriptionEndpoint: string }
+ */
+app.post('/api/sync-tasks', (req, res) => {
+  const { tasks, subscriptionEndpoint } = req.body;
+
+  if (!tasks || !subscriptionEndpoint) {
+    return res.status(400).json({ error: 'Tasks and subscriptionEndpoint are required' });
+  }
+
+  // Store only incomplete tasks with due dates
+  const activeTasks = tasks.filter(t => !t.completed && t.dueDate);
+  userTasks.set(subscriptionEndpoint, activeTasks);
+
+  console.log(`📋 Synced ${activeTasks.length} tasks for subscription`);
+  res.json({ success: true, syncedTasks: activeTasks.length });
+});
+
+/**
  * GET /api/subscriptions/count
  * Get the count of active subscriptions (for admin/debug)
  */
@@ -257,6 +279,83 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ================== Task Deadline Reminder System ==================
+
+/**
+ * Check tasks and send reminders for those due within 3 days
+ * Runs every 2 hours
+ */
+async function checkTaskDeadlines() {
+  const now = new Date();
+  const threeDaysFromNow = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+
+  console.log(`\n⏰ [${now.toISOString()}] Checking task deadlines...`);
+
+  for (const [endpoint, tasks] of userTasks.entries()) {
+    const subscription = subscriptions.get(endpoint);
+    if (!subscription) continue;
+
+    for (const task of tasks) {
+      const dueDate = new Date(task.dueDate);
+      
+      // Check if task is due within 3 days (and not already past)
+      if (dueDate > now && dueDate <= threeDaysFromNow) {
+        const hoursUntilDue = Math.round((dueDate - now) / (1000 * 60 * 60));
+        const daysUntilDue = Math.round(hoursUntilDue / 24);
+
+        let urgencyEmoji = '📋';
+        let timeText = '';
+
+        if (hoursUntilDue <= 24) {
+          urgencyEmoji = '🚨';
+          timeText = hoursUntilDue <= 1 ? 'in less than an hour!' : `in ${hoursUntilDue} hours!`;
+        } else if (daysUntilDue <= 1) {
+          urgencyEmoji = '⚠️';
+          timeText = 'tomorrow!';
+        } else if (daysUntilDue <= 2) {
+          urgencyEmoji = '⏰';
+          timeText = `in ${daysUntilDue} days`;
+        } else {
+          urgencyEmoji = '📅';
+          timeText = `in ${daysUntilDue} days`;
+        }
+
+        const payload = JSON.stringify({
+          title: `${urgencyEmoji} Task Reminder`,
+          body: `"${task.title}" is due ${timeText}`,
+          icon: '/icons/icon-192x192.svg',
+          badge: '/icons/icon-72x72.svg',
+          url: '/?page=home',
+          tag: `task-reminder-${task.id}`, // Prevents duplicate notifications for same task
+          data: { taskId: task.id }
+        });
+
+        try {
+          await webpush.sendNotification(subscription, payload);
+          console.log(`📤 Sent reminder for task: "${task.title}" (due ${timeText})`);
+        } catch (error) {
+          if (error.statusCode === 410) {
+            subscriptions.delete(endpoint);
+            userTasks.delete(endpoint);
+            console.log(`🗑️ Removed expired subscription`);
+          } else {
+            console.error(`❌ Failed to send reminder: ${error.message}`);
+          }
+        }
+      }
+    }
+  }
+
+  console.log(`✅ Deadline check complete. Next check in 2 hours.\n`);
+}
+
+// Run deadline checker every 2 hours (7200000 ms)
+const TWO_HOURS = 2 * 60 * 60 * 1000;
+setInterval(checkTaskDeadlines, TWO_HOURS);
+
+// Also run once on startup (after 30 seconds to allow subscriptions to register)
+setTimeout(checkTaskDeadlines, 30000);
+
 // Start server
 app.listen(PORT, () => {
   console.log(`\n🚀 AcademiaZen Push Notification Server`);
@@ -268,5 +367,7 @@ app.listen(PORT, () => {
   console.log(`   DELETE /api/unsubscribe       - Remove subscription`);
   console.log(`   POST /api/send-notification   - Send notification`);
   console.log(`   POST /api/schedule-notification - Schedule notification`);
-  console.log(`   GET  /api/subscriptions/count - Get subscriber count\n`);
+  console.log(`   POST /api/sync-tasks          - Sync tasks for reminders`);
+  console.log(`   GET  /api/subscriptions/count - Get subscriber count`);
+  console.log(`\n⏰ Task deadline reminders: Every 2 hours for tasks due within 3 days\n`);
 });
