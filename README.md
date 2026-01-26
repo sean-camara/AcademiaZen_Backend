@@ -1,6 +1,10 @@
-# AcademiaZen Push Notification Backend
+# AcademiaZen Backend API
 
-This is the backend server for handling Web Push Notifications for the AcademiaZen PWA.
+This server provides:
+- Firebase Auth verification
+- MongoDB persistence for user state
+- Web push notifications (VAPID)
+- AI proxy endpoint (Gemini)
 
 ## How Push Notifications Work
 
@@ -52,7 +56,7 @@ This is the backend server for handling Web Push Notifications for the AcademiaZ
    ```bash
    cp .env.example .env
    ```
-   Then add your generated VAPID keys to `.env`
+   Then add your generated VAPID keys, MongoDB URI, and Firebase Admin credentials to `.env`
 
 4. **Start the server**
    ```bash
@@ -71,7 +75,7 @@ Returns the VAPID public key needed for push subscription.
 }
 ```
 
-### POST `/api/subscribe`
+### POST `/api/subscribe` (auth required)
 Register a new push subscription.
 
 **Body:**
@@ -88,7 +92,7 @@ Register a new push subscription.
 }
 ```
 
-### DELETE `/api/unsubscribe`
+### DELETE `/api/unsubscribe` (auth required)
 Remove a push subscription.
 
 **Body:**
@@ -99,7 +103,7 @@ Remove a push subscription.
 }
 ```
 
-### POST `/api/send-notification`
+### POST `/api/send-notification` (auth required)
 Send a push notification.
 
 **Body:**
@@ -113,7 +117,7 @@ Send a push notification.
 }
 ```
 
-### POST `/api/schedule-notification`
+### POST `/api/schedule-notification` (auth required)
 Schedule a notification for later.
 
 **Body:**
@@ -140,9 +144,6 @@ See the `AcademiaZen/utils/pushNotifications.ts` for the frontend implementation
 
 ## Production Considerations
 
-- Use a database (Redis, MongoDB, PostgreSQL) instead of in-memory storage
-- Implement rate limiting
-- Add authentication for admin endpoints
 - Use a job queue (Bull, Agenda) for scheduled notifications
 - Set up HTTPS (required for push notifications)
 - Monitor failed notifications and clean up stale subscriptions
@@ -156,3 +157,9 @@ See the `AcademiaZen/utils/pushNotifications.ts` for the frontend implementation
 | `VAPID_EMAIL` | Contact email for VAPID | No |
 | `PORT` | Server port (default: 3001) | No |
 | `FRONTEND_URL` | Frontend URL for CORS | No |
+| `MONGODB_URI` | MongoDB Atlas connection string | Yes |
+| `FIREBASE_PROJECT_ID` | Firebase project ID (if not using JSON) | Yes |
+| `FIREBASE_CLIENT_EMAIL` | Firebase Admin client email | Yes |
+| `FIREBASE_PRIVATE_KEY` | Firebase Admin private key | Yes |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | Full service account JSON (alternative) | No |
+| `GEMINI_API_KEY` | Server-side Gemini API key | Yes |

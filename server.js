@@ -1,146 +1,236 @@
 /**
- * AcademiaZen Push Notification Backend Server
- * 
- * This server handles:
- * 1. VAPID public key distribution
- * 2. Push subscription registration
- * 3. Sending push notifications to subscribed clients
+ * AcademiaZen API Server
+ *
+ * Responsibilities:
+ * - Firebase Auth verification
+ * - MongoDB persistence (Zen state + push subscriptions)
+ * - Web Push notifications
+ * - AI proxy endpoint (Gemini)
  */
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const mongoose = require('mongoose');
 const webpush = require('web-push');
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+const { requireAuth, requireAdmin, initFirebaseAdmin } = require('./middleware/auth');
+const { User, getDefaultState } = require('./models/User');
+const PushSubscription = require('./models/PushSubscription');
 
-// Middleware - Allow multiple origins including Vercel preview URLs
+let GoogleGenerativeAI;
+try {
+  ({ GoogleGenerativeAI } = require('@google/generative-ai'));
+} catch (_) {
+  // Optional at runtime; handled when AI endpoint is called.
+}
+
+const app = express();
+
+// Trust proxy for rate limiting and correct IPs behind Nginx
+app.set('trust proxy', 1);
+
+// ----- Security / middleware -----
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api', apiLimiter);
+
+app.use(express.json({ limit: '15mb' }));
+
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:5173',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:5173',
-  process.env.FRONTEND_URL
+  process.env.FRONTEND_URL,
+  ...(process.env.FRONTEND_URLS ? process.env.FRONTEND_URLS.split(',').map(s => s.trim()).filter(Boolean) : []),
 ].filter(Boolean);
+
+const allowVercelPreview = process.env.ALLOW_VERCEL_PREVIEW === 'true';
+const allowNullOrigin = process.env.ALLOW_NULL_ORIGIN === 'true';
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl)
-    if (!origin) return callback(null, true);
-    
-    // Check if origin is in allowed list
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    
-    // Allow all Vercel preview/production URLs
-    if (origin && (origin.includes('.vercel.app') || origin.includes('vercel.app'))) {
-      return callback(null, true);
-    }
-    
-    console.log('CORS blocked origin:', origin);
+    if (!origin && allowNullOrigin) return callback(null, true);
+    if (!origin) return callback(null, false);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    if (allowVercelPreview && origin.includes('.vercel.app')) return callback(null, true);
     return callback(null, false);
   },
-  credentials: true
+  credentials: true,
 }));
-app.use(express.json());
 
-// In-memory store for subscriptions (use a database in production)
-const subscriptions = new Map();
+// ----- Firebase Admin -----
+initFirebaseAdmin();
 
-// In-memory store for tasks with due dates (use a database in production)
-const userTasks = new Map(); // { oderId/endpoint: [{ id, title, dueDate }] }
-
-// Validate VAPID keys
-if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
-  console.error('\n❌ Error: VAPID keys not found!');
-  console.log('Please run: npm run generate-vapid');
-  console.log('Then add the keys to your .env file\n');
-  
-  // Generate keys for convenience
-  const keys = webpush.generateVAPIDKeys();
-  console.log('Here are freshly generated keys:\n');
-  console.log(`VAPID_PUBLIC_KEY=${keys.publicKey}`);
-  console.log(`VAPID_PRIVATE_KEY=${keys.privateKey}`);
-  console.log('\nAdd these to .env and restart the server.\n');
+// ----- MongoDB -----
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error('Missing MONGODB_URI in environment');
   process.exit(1);
 }
 
-// Configure web-push with VAPID details
+mongoose.connect(MONGODB_URI, {
+  autoIndex: true,
+}).then(() => {
+  console.log('MongoDB connected');
+}).catch(err => {
+  console.error('MongoDB connection error:', err);
+  process.exit(1);
+});
+
+// ----- Web Push -----
+if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
+  console.error('VAPID keys not found. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY.');
+  process.exit(1);
+}
+
 webpush.setVapidDetails(
   process.env.VAPID_EMAIL || 'mailto:admin@academiazen.app',
   process.env.VAPID_PUBLIC_KEY,
   process.env.VAPID_PRIVATE_KEY
 );
 
-// ================== API Routes ==================
+// ----- Helpers -----
+async function getOrCreateUser(uid, email) {
+  let user = await User.findOne({ uid });
+  if (!user) {
+    user = await User.create({
+      uid,
+      email: email || '',
+      state: getDefaultState(),
+    });
+  }
+  return user;
+}
 
-/**
- * GET /api/vapid-public-key
- * Returns the VAPID public key for client subscription
- */
+async function sendNotificationToUser(uid, payload, options = {}) {
+  const subs = await PushSubscription.find({ uid }).lean();
+  const results = await Promise.allSettled(subs.map(async (sub) => {
+    try {
+      await webpush.sendNotification(sub.subscription, payload, options);
+      return { id: sub._id.toString(), success: true };
+    } catch (error) {
+      if (error.statusCode === 410) {
+        await PushSubscription.deleteOne({ _id: sub._id });
+      }
+      return { id: sub._id.toString(), success: false, error: error.message };
+    }
+  }));
+  return results;
+}
+
+function isValidState(state) {
+  if (!state || typeof state !== 'object') return false;
+  if (!Array.isArray(state.tasks)) return false;
+  if (!Array.isArray(state.subjects)) return false;
+  if (!Array.isArray(state.flashcards)) return false;
+  if (!Array.isArray(state.folders)) return false;
+  if (!state.profile || !state.settings) return false;
+  return true;
+}
+
+// ----- Routes -----
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 app.get('/api/vapid-public-key', (req, res) => {
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
 });
 
-/**
- * POST /api/subscribe
- * Register a new push subscription
- * Body: { subscription: PushSubscription, userId?: string }
- */
-app.post('/api/subscribe', (req, res) => {
-  const { subscription, userId } = req.body;
-
-  if (!subscription || !subscription.endpoint) {
-    return res.status(400).json({ error: 'Invalid subscription object' });
-  }
-
-  // Store subscription (use endpoint as key if no userId)
-  const id = userId || subscription.endpoint;
-  subscriptions.set(id, subscription);
-
-  console.log(`✅ New subscription registered: ${id.substring(0, 50)}...`);
-  console.log(`   Total subscriptions: ${subscriptions.size}`);
-
-  res.status(201).json({ 
-    success: true, 
-    message: 'Subscription registered successfully' 
-  });
-});
-
-/**
- * DELETE /api/unsubscribe
- * Remove a push subscription
- * Body: { endpoint: string }
- */
-app.delete('/api/unsubscribe', (req, res) => {
-  const { endpoint, userId } = req.body;
-  const id = userId || endpoint;
-
-  if (subscriptions.has(id)) {
-    subscriptions.delete(id);
-    console.log(`🗑️  Subscription removed: ${id.substring(0, 50)}...`);
-    res.json({ success: true, message: 'Unsubscribed successfully' });
-  } else {
-    res.status(404).json({ error: 'Subscription not found' });
+// --- Auth-protected ---
+app.get('/api/state', requireAuth, async (req, res) => {
+  try {
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    res.json({ state: user.state });
+  } catch (err) {
+    console.error('Failed to get state:', err);
+    res.status(500).json({ error: 'Failed to load state' });
   }
 });
 
-/**
- * POST /api/send-notification
- * Send a push notification to a specific subscription or all subscribers
- * Body: { 
- *   title: string, 
- *   body: string, 
- *   icon?: string,
- *   url?: string,
- *   userId?: string (if not provided, sends to all)
- * }
- */
-app.post('/api/send-notification', async (req, res) => {
-  const { title, body, icon, url, data, userId } = req.body;
+app.put('/api/state', requireAuth, async (req, res) => {
+  try {
+    const { state } = req.body;
+    if (!isValidState(state)) {
+      return res.status(400).json({ error: 'Invalid state payload' });
+    }
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    user.state = state;
+    user.email = req.user.email || user.email;
+    await user.save();
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to save state:', err);
+    res.status(500).json({ error: 'Failed to save state' });
+  }
+});
 
+app.delete('/api/account', requireAuth, async (req, res) => {
+  try {
+    await Promise.all([
+      User.deleteOne({ uid: req.user.uid }),
+      PushSubscription.deleteMany({ uid: req.user.uid }),
+    ]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to delete account data:', err);
+    res.status(500).json({ error: 'Failed to delete account data' });
+  }
+});
+
+app.post('/api/subscribe', requireAuth, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ error: 'Invalid subscription object' });
+    }
+
+    await PushSubscription.findOneAndUpdate(
+      { uid: req.user.uid, endpoint: subscription.endpoint },
+      { uid: req.user.uid, endpoint: subscription.endpoint, subscription },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.status(201).json({ success: true, message: 'Subscription registered' });
+  } catch (err) {
+    console.error('Subscribe error:', err);
+    res.status(500).json({ error: 'Failed to register subscription' });
+  }
+});
+
+app.delete('/api/unsubscribe', requireAuth, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    if (!endpoint) {
+      return res.status(400).json({ error: 'Endpoint is required' });
+    }
+    await PushSubscription.deleteOne({ uid: req.user.uid, endpoint });
+    res.json({ success: true, message: 'Unsubscribed' });
+  } catch (err) {
+    console.error('Unsubscribe error:', err);
+    res.status(500).json({ error: 'Failed to unsubscribe' });
+  }
+});
+
+app.get('/api/subscriptions/count', requireAuth, requireAdmin, async (req, res) => {
+  const count = await PushSubscription.countDocuments({});
+  res.json({ count });
+});
+
+app.post('/api/send-notification', requireAuth, async (req, res) => {
+  const { title, body, icon, url, data } = req.body;
   if (!title || !body) {
     return res.status(400).json({ error: 'Title and body are required' });
   }
@@ -152,75 +242,30 @@ app.post('/api/send-notification', async (req, res) => {
     badge: '/icons/icon-72x72.svg',
     url: url || '/',
     data: data || {},
-    timestamp: Date.now()
+    timestamp: Date.now(),
   });
 
-  const options = {
-    TTL: 86400, // Time to live: 24 hours
-    urgency: 'normal'
-  };
-
   try {
-    if (userId && subscriptions.has(userId)) {
-      // Send to specific user
-      await webpush.sendNotification(subscriptions.get(userId), payload, options);
-      res.json({ success: true, message: 'Notification sent to user' });
-    } else if (!userId) {
-      // Send to all subscribers
-      const results = await Promise.allSettled(
-        Array.from(subscriptions.entries()).map(async ([id, sub]) => {
-          try {
-            await webpush.sendNotification(sub, payload, options);
-            return { id, success: true };
-          } catch (error) {
-            // Remove invalid subscriptions (410 Gone means unsubscribed)
-            if (error.statusCode === 410) {
-              subscriptions.delete(id);
-              console.log(`🗑️  Removed expired subscription: ${id.substring(0, 50)}...`);
-            }
-            return { id, success: false, error: error.message };
-          }
-        })
-      );
-
-      const sent = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
-      res.json({ 
-        success: true, 
-        message: `Notification sent to ${sent}/${subscriptions.size} subscribers` 
-      });
-    } else {
-      res.status(404).json({ error: 'User subscription not found' });
-    }
-  } catch (error) {
-    console.error('❌ Push notification error:', error);
+    const results = await sendNotificationToUser(req.user.uid, payload, { TTL: 86400, urgency: 'normal' });
+    const sent = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
+    res.json({ success: true, message: `Notification sent to ${sent} device(s)` });
+  } catch (err) {
+    console.error('Push notification error:', err);
     res.status(500).json({ error: 'Failed to send notification' });
   }
 });
 
-/**
- * POST /api/schedule-notification
- * Schedule a notification to be sent at a specific time
- * Body: { 
- *   title: string, 
- *   body: string, 
- *   scheduledTime: ISO string,
- *   userId?: string
- * }
- */
-app.post('/api/schedule-notification', (req, res) => {
-  const { title, body, scheduledTime, userId, icon, url } = req.body;
-
+app.post('/api/schedule-notification', requireAuth, (req, res) => {
+  const { title, body, scheduledTime, icon, url } = req.body;
   if (!title || !body || !scheduledTime) {
     return res.status(400).json({ error: 'Title, body, and scheduledTime are required' });
   }
 
   const delay = new Date(scheduledTime).getTime() - Date.now();
-  
   if (delay < 0) {
     return res.status(400).json({ error: 'Scheduled time must be in the future' });
   }
 
-  // Schedule the notification (in production, use a proper job queue)
   setTimeout(async () => {
     const payload = JSON.stringify({
       title,
@@ -228,175 +273,150 @@ app.post('/api/schedule-notification', (req, res) => {
       icon: icon || '/icons/icon-192x192.svg',
       badge: '/icons/icon-72x72.svg',
       url: url || '/',
-      timestamp: Date.now()
+      timestamp: Date.now(),
     });
-
-    const targets = userId && subscriptions.has(userId) 
-      ? [[userId, subscriptions.get(userId)]]
-      : Array.from(subscriptions.entries());
-
-    for (const [id, sub] of targets) {
-      try {
-        await webpush.sendNotification(sub, payload);
-        console.log(`📤 Scheduled notification sent to: ${id.substring(0, 50)}...`);
-      } catch (error) {
-        if (error.statusCode === 410) {
-          subscriptions.delete(id);
-        }
-        console.error(`❌ Failed to send scheduled notification: ${error.message}`);
-      }
-    }
+    await sendNotificationToUser(req.user.uid, payload);
   }, delay);
 
-  console.log(`⏰ Notification scheduled for: ${scheduledTime}`);
-  res.json({ 
-    success: true, 
-    message: `Notification scheduled for ${scheduledTime}` 
-  });
+  res.json({ success: true, message: `Notification scheduled for ${scheduledTime}` });
 });
 
-/**
- * POST /api/notify-new-task
- * Send immediate notification when a new task is added that's due within 3 days
- * Body: { task: { id, title, dueDate }, subscriptionEndpoint: string }
- */
-app.post('/api/notify-new-task', async (req, res) => {
-  const { task, subscriptionEndpoint } = req.body;
-
-  if (!task || !subscriptionEndpoint || !task.dueDate) {
-    return res.status(400).json({ error: 'Task with dueDate and subscriptionEndpoint are required' });
-  }
-
-  const subscription = subscriptions.get(subscriptionEndpoint);
-  if (!subscription) {
-    return res.status(404).json({ error: 'Subscription not found' });
+app.post('/api/notify-new-task', requireAuth, async (req, res) => {
+  const { task } = req.body;
+  if (!task || !task.dueDate) {
+    return res.status(400).json({ error: 'Task with dueDate is required' });
   }
 
   const now = new Date();
   const dueDate = new Date(task.dueDate);
   const threeDaysFromNow = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
 
-  // Only notify if task is due within 3 days
-  if (dueDate > now && dueDate <= threeDaysFromNow) {
-    const hoursUntilDue = Math.round((dueDate - now) / (1000 * 60 * 60));
-    const daysUntilDue = Math.round(hoursUntilDue / 24);
-
-    let urgencyEmoji = '📋';
-    let timeText = '';
-
-    if (hoursUntilDue <= 24) {
-      urgencyEmoji = '🚨';
-      timeText = hoursUntilDue <= 1 ? 'in less than an hour!' : `in ${hoursUntilDue} hours!`;
-    } else if (daysUntilDue <= 1) {
-      urgencyEmoji = '⚠️';
-      timeText = 'tomorrow!';
-    } else if (daysUntilDue <= 2) {
-      urgencyEmoji = '⏰';
-      timeText = `in ${daysUntilDue} days`;
-    } else {
-      urgencyEmoji = '📅';
-      timeText = `in ${daysUntilDue} days`;
-    }
-
-    const payload = JSON.stringify({
-      title: `${urgencyEmoji} New Task Added`,
-      body: `"${task.title}" is due ${timeText}`,
-      icon: '/icons/icon-192x192.svg',
-      badge: '/icons/icon-72x72.svg',
-      url: '/?page=home',
-      tag: `new-task-${task.id}`,
-      data: { taskId: task.id }
-    });
-
-    try {
-      await webpush.sendNotification(subscription, payload);
-      console.log(`📤 Immediate notification sent for new task: "${task.title}" (due ${timeText})`);
-      return res.json({ success: true, message: 'Notification sent', dueIn: timeText });
-    } catch (error) {
-      if (error.statusCode === 410) {
-        subscriptions.delete(subscriptionEndpoint);
-        userTasks.delete(subscriptionEndpoint);
-        return res.status(410).json({ error: 'Subscription expired' });
-      }
-      console.error(`❌ Failed to send immediate notification: ${error.message}`);
-      return res.status(500).json({ error: 'Failed to send notification' });
-    }
+  if (dueDate <= now || dueDate > threeDaysFromNow) {
+    return res.json({ success: true, message: 'Task not within 3-day window' });
   }
 
-  res.json({ success: true, message: 'Task not within 3-day window, no immediate notification' });
-});
+  const hoursUntilDue = Math.round((dueDate - now) / (1000 * 60 * 60));
+  const daysUntilDue = Math.round(hoursUntilDue / 24);
 
-/**
- * POST /api/sync-tasks
- * Sync user's tasks for deadline reminders
- * Body: { tasks: [{ id, title, dueDate, completed }], subscriptionEndpoint: string }
- */
-app.post('/api/sync-tasks', (req, res) => {
-  const { tasks, subscriptionEndpoint } = req.body;
+  let urgencyEmoji = '[SOON]';
+  let timeText = '';
 
-  if (!tasks || !subscriptionEndpoint) {
-    return res.status(400).json({ error: 'Tasks and subscriptionEndpoint are required' });
+  if (hoursUntilDue <= 24) {
+    urgencyEmoji = '[SOON]';
+    timeText = hoursUntilDue <= 1 ? 'in less than an hour!' : `in ${hoursUntilDue} hours!`;
+  } else if (daysUntilDue <= 1) {
+    urgencyEmoji = '[ALERT]';
+    timeText = 'tomorrow!';
+  } else if (daysUntilDue <= 2) {
+    urgencyEmoji = '[DUE]';
+    timeText = `in ${daysUntilDue} days`;
+  } else {
+    urgencyEmoji = '[DUE]';
+    timeText = `in ${daysUntilDue} days`;
   }
 
-  // Store only incomplete tasks with due dates
-  const activeTasks = tasks.filter(t => !t.completed && t.dueDate);
-  userTasks.set(subscriptionEndpoint, activeTasks);
+  const payload = JSON.stringify({
+    title: `${urgencyEmoji} New Task Added`,
+    body: `"${task.title}" is due ${timeText}`,
+    icon: '/icons/icon-192x192.svg',
+    badge: '/icons/icon-72x72.svg',
+    url: '/?page=home',
+    tag: `new-task-${task.id}`,
+    data: { taskId: task.id },
+  });
 
-  console.log(`📋 Synced ${activeTasks.length} tasks for subscription`);
-  res.json({ success: true, syncedTasks: activeTasks.length });
+  try {
+    await sendNotificationToUser(req.user.uid, payload);
+    res.json({ success: true, message: 'Notification sent', dueIn: timeText });
+  } catch (err) {
+    console.error('Immediate task notification failed:', err);
+    res.status(500).json({ error: 'Failed to send notification' });
+  }
 });
 
-/**
- * GET /api/subscriptions/count
- * Get the count of active subscriptions (for admin/debug)
- */
-app.get('/api/subscriptions/count', (req, res) => {
-  res.json({ count: subscriptions.size });
+app.post('/api/sync-tasks', requireAuth, async (req, res) => {
+  const { tasks } = req.body;
+  if (!Array.isArray(tasks)) {
+    return res.status(400).json({ error: 'Tasks array is required' });
+  }
+
+  try {
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    user.state.tasks = tasks;
+    await user.save();
+    res.json({ success: true, syncedTasks: tasks.length });
+  } catch (err) {
+    console.error('Sync tasks failed:', err);
+    res.status(500).json({ error: 'Failed to sync tasks' });
+  }
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// AI proxy
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
-// ================== Task Deadline Reminder System ==================
+app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'AI API key is not configured' });
+    }
+    if (!GoogleGenerativeAI) {
+      return res.status(500).json({ error: 'AI dependency is missing' });
+    }
 
-/**
- * Check tasks and send reminders for those due within 3 days
- * Runs every 2 hours
- */
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+    const model = genAI.getGenerativeModel({ model: modelName });
+    const result = await model.generateContent(prompt);
+    const text = result?.response?.text?.() || '';
+    res.json({ text });
+  } catch (err) {
+    console.error('AI proxy error:', err);
+    res.status(500).json({ error: 'AI request failed' });
+  }
+});
+
+// ----- Background job: deadline reminders -----
 async function checkTaskDeadlines() {
   const now = new Date();
   const threeDaysFromNow = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
 
-  console.log(`\n⏰ [${now.toISOString()}] Checking task deadlines...`);
+  try {
+    const users = await User.find({
+      'state.settings.notifications': true,
+      'state.settings.deadlineAlerts': true,
+    }, { uid: 1, 'state.tasks': 1 }).lean();
 
-  for (const [endpoint, tasks] of userTasks.entries()) {
-    const subscription = subscriptions.get(endpoint);
-    if (!subscription) continue;
+    for (const user of users) {
+      const tasks = (user.state?.tasks || []).filter(t => t && !t.completed && t.dueDate);
+      for (const task of tasks) {
+        const dueDate = new Date(task.dueDate);
+        if (dueDate <= now || dueDate > threeDaysFromNow) continue;
 
-    for (const task of tasks) {
-      const dueDate = new Date(task.dueDate);
-      
-      // Check if task is due within 3 days (and not already past)
-      if (dueDate > now && dueDate <= threeDaysFromNow) {
         const hoursUntilDue = Math.round((dueDate - now) / (1000 * 60 * 60));
         const daysUntilDue = Math.round(hoursUntilDue / 24);
-
-        let urgencyEmoji = '📋';
+        let urgencyEmoji = '[SOON]';
         let timeText = '';
 
         if (hoursUntilDue <= 24) {
-          urgencyEmoji = '🚨';
+          urgencyEmoji = '[SOON]';
           timeText = hoursUntilDue <= 1 ? 'in less than an hour!' : `in ${hoursUntilDue} hours!`;
         } else if (daysUntilDue <= 1) {
-          urgencyEmoji = '⚠️';
+          urgencyEmoji = '[ALERT]';
           timeText = 'tomorrow!';
         } else if (daysUntilDue <= 2) {
-          urgencyEmoji = '⏰';
+          urgencyEmoji = '[DUE]';
           timeText = `in ${daysUntilDue} days`;
         } else {
-          urgencyEmoji = '📅';
+          urgencyEmoji = '[DUE]';
           timeText = `in ${daysUntilDue} days`;
         }
 
@@ -406,49 +426,23 @@ async function checkTaskDeadlines() {
           icon: '/icons/icon-192x192.svg',
           badge: '/icons/icon-72x72.svg',
           url: '/?page=home',
-          tag: `task-reminder-${task.id}`, // Prevents duplicate notifications for same task
-          data: { taskId: task.id }
+          tag: `task-reminder-${task.id}`,
+          data: { taskId: task.id },
         });
 
-        try {
-          await webpush.sendNotification(subscription, payload);
-          console.log(`📤 Sent reminder for task: "${task.title}" (due ${timeText})`);
-        } catch (error) {
-          if (error.statusCode === 410) {
-            subscriptions.delete(endpoint);
-            userTasks.delete(endpoint);
-            console.log(`🗑️ Removed expired subscription`);
-          } else {
-            console.error(`❌ Failed to send reminder: ${error.message}`);
-          }
-        }
+        await sendNotificationToUser(user.uid, payload);
       }
     }
+  } catch (err) {
+    console.error('Deadline reminder job failed:', err);
   }
-
-  console.log(`✅ Deadline check complete. Next check in 2 hours.\n`);
 }
 
-// Run deadline checker every 2 hours (7200000 ms)
 const TWO_HOURS = 2 * 60 * 60 * 1000;
 setInterval(checkTaskDeadlines, TWO_HOURS);
-
-// Also run once on startup (after 30 seconds to allow subscriptions to register)
 setTimeout(checkTaskDeadlines, 30000);
 
-// Start server
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n🚀 AcademiaZen Push Notification Server`);
-  console.log(`   Running on http://localhost:${PORT}`);
-  console.log(`   VAPID Public Key: ${process.env.VAPID_PUBLIC_KEY.substring(0, 30)}...`);
-  console.log(`\n📡 Endpoints:`);
-  console.log(`   GET  /api/vapid-public-key    - Get VAPID public key`);
-  console.log(`   POST /api/subscribe           - Register subscription`);
-  console.log(`   DELETE /api/unsubscribe       - Remove subscription`);
-  console.log(`   POST /api/send-notification   - Send notification`);
-  console.log(`   POST /api/schedule-notification - Schedule notification`);
-  console.log(`   POST /api/notify-new-task     - Immediate notification for new task`);
-  console.log(`   POST /api/sync-tasks          - Sync tasks for reminders`);
-  console.log(`   GET  /api/subscriptions/count - Get subscriber count`);
-  console.log(`\n⏰ Task deadline reminders: Every 2 hours for tasks due within 3 days\n`);
+  console.log(`AcademiaZen API listening on port ${PORT}`);
 });
