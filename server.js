@@ -243,7 +243,9 @@ const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
 const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
 const MAX_AI_PROMPT_CHARS = Number(process.env.MAX_AI_PROMPT_CHARS || 12000);
 const AI_BASE_URL = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
-const AI_MODEL = process.env.AI_MODEL || 'deepseek/deepseek-r1-0528:free';
+const AI_MODEL_DEFAULT = process.env.AI_MODEL || 'deepseek/deepseek-r1-0528:free';
+const AI_MODEL_FAST = process.env.AI_MODEL_FAST || 'deepseek/deepseek-chat';
+const AI_MODEL_DEEP = process.env.AI_MODEL_DEEP || AI_MODEL_DEFAULT;
 const OPENROUTER_API_KEY = resolveEnvRef(process.env.OPENROUTER_API_KEY || process.env.DEEPSEEK_API_KEY);
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || process.env.FRONTEND_URL || 'https://academiazen.app';
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || 'AcademiaZen';
@@ -949,7 +951,7 @@ const aiLimiter = rateLimit({
 
 app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
   try {
-    const { prompt } = req.body;
+    const { prompt, mode } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required' });
     }
@@ -963,8 +965,9 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
         return res.status(402).json({ error: 'Premium subscription required' });
       }
     }
+    const selectedModel = mode === 'deep' ? AI_MODEL_DEEP : AI_MODEL_FAST;
     const payload = {
-      model: AI_MODEL,
+      model: selectedModel,
       messages: [
         { role: 'user', content: prompt },
       ],

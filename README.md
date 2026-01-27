@@ -163,7 +163,9 @@ See the `AcademiaZen/utils/pushNotifications.ts` for the frontend implementation
 | `FIREBASE_PRIVATE_KEY` | Firebase Admin private key | Yes |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | Full service account JSON (alternative) | No |
 | `OPENROUTER_API_KEY` | OpenRouter API key (sk-or-...) | Yes |
-| `AI_MODEL` | Model ID (default: deepseek/deepseek-r1-0528:free) | No |
+| `AI_MODEL` | Default model ID (fallback) | No |
+| `AI_MODEL_FAST` | Fast model (default path) | No |
+| `AI_MODEL_DEEP` | Deep analysis model | No |
 | `AI_BASE_URL` | OpenRouter base URL override | No |
 | `R2_ENDPOINT` | Cloudflare R2 S3 endpoint | Yes (for PDF uploads) |
 | `R2_BUCKET` | R2 bucket name | Yes |
