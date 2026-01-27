@@ -5,7 +5,7 @@
  * - Firebase Auth verification
  * - MongoDB persistence (Zen state + push subscriptions)
  * - Web Push notifications
- * - AI proxy endpoint (Gemini)
+ * - AI proxy endpoint (OpenRouter / DeepSeek)
  */
 
 require('dotenv').config();
@@ -20,13 +20,6 @@ const crypto = require('crypto');
 const { requireAuth, requireAdmin, initFirebaseAdmin } = require('./middleware/auth');
 const { User, getDefaultState } = require('./models/User');
 const PushSubscription = require('./models/PushSubscription');
-
-let GoogleGenerativeAI;
-try {
-  ({ GoogleGenerativeAI } = require('@google/generative-ai'));
-} catch (_) {
-  // Optional at runtime; handled when AI endpoint is called.
-}
 
 const app = express();
 
@@ -228,6 +221,15 @@ const PAYMONGO_SECRET_KEY = resolveEnvRef(process.env.PAYMONGO_SECRET_KEY);
 const PAYMONGO_API_BASE = process.env.PAYMONGO_API_BASE || 'https://api.paymongo.com/v1';
 const PAYMONGO_WEBHOOK_SECRET = resolveEnvRef(process.env.PAYMONGO_WEBHOOK_SECRET);
 
+const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
+const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
+const MAX_AI_PROMPT_CHARS = Number(process.env.MAX_AI_PROMPT_CHARS || 12000);
+const AI_BASE_URL = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
+const AI_MODEL = process.env.AI_MODEL || 'deepseek/deepseek-r1-0528:free';
+const OPENROUTER_API_KEY = resolveEnvRef(process.env.OPENROUTER_API_KEY || process.env.DEEPSEEK_API_KEY);
+const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || process.env.FRONTEND_URL || 'https://academiazen.app';
+const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || 'AcademiaZen';
+
 const BILLING_PLANS = {
   premium: {
     monthly: {
@@ -349,6 +351,40 @@ async function paymongoRequest(path, { method = 'GET', body } = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = data?.errors?.[0]?.detail || data?.errors?.[0]?.message || 'PayMongo request failed';
+    const error = new Error(message);
+    error.statusCode = response.status;
+    error.payload = data;
+    throw error;
+  }
+  return data;
+}
+
+async function openrouterRequest(path, { method = 'POST', body } = {}) {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error('OPENROUTER_API_KEY is not configured');
+  }
+
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+  };
+
+  if (OPENROUTER_SITE_URL) {
+    headers['HTTP-Referer'] = OPENROUTER_SITE_URL;
+  }
+  if (OPENROUTER_APP_TITLE) {
+    headers['X-Title'] = OPENROUTER_APP_TITLE;
+  }
+
+  const response = await fetch(`${AI_BASE_URL}${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data?.error?.message || data?.error || data?.message || 'AI request failed';
     const error = new Error(message);
     error.statusCode = response.status;
     error.payload = data;
@@ -802,23 +838,25 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required' });
     }
-    const user = await getOrCreateUser(req.user.uid, req.user.email);
-    const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
-    if (!hasPremium) {
-      return res.status(402).json({ error: 'Premium subscription required' });
+    if (prompt.length > MAX_AI_PROMPT_CHARS) {
+      return res.status(413).json({ error: 'Prompt is too long' });
     }
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: 'AI API key is not configured' });
+    if (!ALLOW_FREE_AI) {
+      const user = await getOrCreateUser(req.user.uid, req.user.email);
+      const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+      if (!hasPremium) {
+        return res.status(402).json({ error: 'Premium subscription required' });
+      }
     }
-    if (!GoogleGenerativeAI) {
-      return res.status(500).json({ error: 'AI dependency is missing' });
-    }
+    const payload = {
+      model: AI_MODEL,
+      messages: [
+        { role: 'user', content: prompt },
+      ],
+    };
 
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-    const model = genAI.getGenerativeModel({ model: modelName });
-    const result = await model.generateContent(prompt);
-    const text = result?.response?.text?.() || '';
+    const data = await openrouterRequest('/chat/completions', { method: 'POST', body: payload });
+    const text = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || '';
     res.json({ text });
   } catch (err) {
     console.error('AI proxy error:', err);

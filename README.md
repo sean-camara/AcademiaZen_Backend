@@ -4,7 +4,7 @@ This server provides:
 - Firebase Auth verification
 - MongoDB persistence for user state
 - Web push notifications (VAPID)
-- AI proxy endpoint (Gemini)
+- AI proxy endpoint (OpenRouter / DeepSeek)
 
 ## How Push Notifications Work
 
@@ -162,4 +162,6 @@ See the `AcademiaZen/utils/pushNotifications.ts` for the frontend implementation
 | `FIREBASE_CLIENT_EMAIL` | Firebase Admin client email | Yes |
 | `FIREBASE_PRIVATE_KEY` | Firebase Admin private key | Yes |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | Full service account JSON (alternative) | No |
-| `GEMINI_API_KEY` | Server-side Gemini API key | Yes |
+| `OPENROUTER_API_KEY` | OpenRouter API key (sk-or-...) | Yes |
+| `AI_MODEL` | Model ID (default: deepseek/deepseek-r1-0528:free) | No |
+| `AI_BASE_URL` | OpenRouter base URL override | No |
