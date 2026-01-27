@@ -1,5 +1,15 @@
 const mongoose = require('mongoose');
 
+const PdfAssetSchema = new mongoose.Schema({
+  key: { type: String, default: '' },
+  name: { type: String, default: '' },
+  size: { type: Number, default: 0 },
+  contentType: { type: String, default: '' },
+  url: { type: String, default: '' },
+  text: { type: String, default: '' },
+  textUpdatedAt: { type: Date, default: null },
+}, { _id: false });
+
 const TaskSchema = new mongoose.Schema({
   id: { type: String, required: true },
   title: { type: String, default: '' },
@@ -7,10 +17,7 @@ const TaskSchema = new mongoose.Schema({
   completed: { type: Boolean, default: false },
   subjectId: { type: String, default: '' },
   notes: { type: String, default: '' },
-  pdfAttachment: {
-    name: { type: String, default: '' },
-    data: { type: String, default: '' },
-  },
+  pdfAttachment: { type: PdfAssetSchema, default: null },
 }, { _id: false });
 
 const SubjectSchema = new mongoose.Schema({
@@ -33,6 +40,7 @@ const FolderItemSchema = new mongoose.Schema({
   title: { type: String, default: '' },
   type: { type: String, enum: ['note', 'pdf'], default: 'note' },
   content: { type: String, default: '' },
+  file: { type: PdfAssetSchema, default: null },
 }, { _id: false });
 
 const FolderSchema = new mongoose.Schema({

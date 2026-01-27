@@ -165,3 +165,8 @@ See the `AcademiaZen/utils/pushNotifications.ts` for the frontend implementation
 | `OPENROUTER_API_KEY` | OpenRouter API key (sk-or-...) | Yes |
 | `AI_MODEL` | Model ID (default: deepseek/deepseek-r1-0528:free) | No |
 | `AI_BASE_URL` | OpenRouter base URL override | No |
+| `R2_ENDPOINT` | Cloudflare R2 S3 endpoint | Yes (for PDF uploads) |
+| `R2_BUCKET` | R2 bucket name | Yes |
+| `R2_ACCESS_KEY_ID` | R2 access key ID | Yes |
+| `R2_SECRET_ACCESS_KEY` | R2 secret access key | Yes |
+| `R2_PUBLIC_BASE_URL` | Optional public base URL | No |

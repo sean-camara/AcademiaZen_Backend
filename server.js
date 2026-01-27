@@ -16,6 +16,8 @@ const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const webpush = require('web-push');
 const crypto = require('crypto');
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const { requireAuth, requireAdmin, initFirebaseAdmin } = require('./middleware/auth');
 const { User, getDefaultState } = require('./models/User');
@@ -158,8 +160,12 @@ function sanitizeStateForStorage(state) {
 
   if (Array.isArray(sanitized.tasks)) {
     sanitized.tasks = sanitized.tasks.map(task => {
-      if (task?.pdfAttachment?.data && task.pdfAttachment.data.length > MAX_ATTACHMENT_BASE64_LEN) {
-        task.pdfAttachment.data = '';
+      if (task?.pdfAttachment) {
+        if (task.pdfAttachment.data) delete task.pdfAttachment.data;
+        if (task.pdfAttachment.url) delete task.pdfAttachment.url;
+        if (task.pdfAttachment.text && task.pdfAttachment.text.length > MAX_PDF_TEXT_CHARS) {
+          task.pdfAttachment.text = task.pdfAttachment.text.slice(0, MAX_PDF_TEXT_CHARS);
+        }
       }
       return task;
     });
@@ -169,8 +175,17 @@ function sanitizeStateForStorage(state) {
     sanitized.folders = sanitized.folders.map(folder => {
       if (Array.isArray(folder.items)) {
         folder.items = folder.items.map(item => {
-          if (item?.type === 'pdf' && item.content && item.content.length > MAX_ATTACHMENT_BASE64_LEN) {
-            item.content = '';
+          if (item?.type === 'pdf') {
+            if (item.content && String(item.content).startsWith('data:application/pdf')) {
+              item.content = '';
+            }
+            if (item.file) {
+              if (item.file.data) delete item.file.data;
+              if (item.file.url) delete item.file.url;
+              if (item.file.text && item.file.text.length > MAX_PDF_TEXT_CHARS) {
+                item.file.text = item.file.text.slice(0, MAX_PDF_TEXT_CHARS);
+              }
+            }
           }
           return item;
         });
@@ -183,9 +198,8 @@ function sanitizeStateForStorage(state) {
   if (sizeBytes > MAX_STATE_BYTES) {
     if (Array.isArray(sanitized.tasks)) {
       sanitized.tasks = sanitized.tasks.map(task => {
-        if (task?.pdfAttachment?.data) {
-          task.pdfAttachment.data = '';
-        }
+        if (task?.pdfAttachment?.data) delete task.pdfAttachment.data;
+        if (task?.pdfAttachment?.url) delete task.pdfAttachment.url;
         return task;
       });
     }
@@ -193,8 +207,12 @@ function sanitizeStateForStorage(state) {
       sanitized.folders = sanitized.folders.map(folder => {
         if (Array.isArray(folder.items)) {
           folder.items = folder.items.map(item => {
-            if (item?.type === 'pdf' && item.content) {
-              item.content = '';
+            if (item?.type === 'pdf') {
+              if (item.content && String(item.content).startsWith('data:application/pdf')) {
+                item.content = '';
+              }
+              if (item.file?.data) delete item.file.data;
+              if (item.file?.url) delete item.file.url;
             }
             return item;
           });
@@ -229,6 +247,45 @@ const AI_MODEL = process.env.AI_MODEL || 'deepseek/deepseek-r1-0528:free';
 const OPENROUTER_API_KEY = resolveEnvRef(process.env.OPENROUTER_API_KEY || process.env.DEEPSEEK_API_KEY);
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || process.env.FRONTEND_URL || 'https://academiazen.app';
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || 'AcademiaZen';
+
+const R2_ENDPOINT = process.env.R2_ENDPOINT || '';
+const R2_BUCKET = process.env.R2_BUCKET || '';
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || '';
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || '';
+const R2_PUBLIC_BASE_URL = process.env.R2_PUBLIC_BASE_URL || '';
+const R2_SIGNED_URL_TTL = Number(process.env.R2_SIGNED_URL_TTL || 900);
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 15 * 1024 * 1024);
+const MAX_PDF_TEXT_CHARS = Number(process.env.MAX_PDF_TEXT_CHARS || 12000);
+
+let r2Client;
+function getR2Client() {
+  if (!R2_ENDPOINT || !R2_BUCKET || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
+    return null;
+  }
+  if (!r2Client) {
+    r2Client = new S3Client({
+      region: 'auto',
+      endpoint: R2_ENDPOINT,
+      credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY,
+      },
+    });
+  }
+  return r2Client;
+}
+
+function ensureR2() {
+  const client = getR2Client();
+  if (!client) {
+    throw new Error('R2 is not configured');
+  }
+  return client;
+}
+
+function isOwnedKey(key, uid) {
+  return typeof key === 'string' && key.startsWith(`${uid}/`);
+}
 
 const BILLING_PLANS = {
   premium: {
@@ -445,6 +502,64 @@ app.get('/health', (req, res) => {
 
 app.get('/api/vapid-public-key', (req, res) => {
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
+});
+
+// ----- R2 Uploads -----
+app.post('/api/uploads/presign', requireAuth, async (req, res) => {
+  try {
+    const { filename, contentType, size } = req.body || {};
+    if (!filename || !contentType || !size) {
+      return res.status(400).json({ error: 'filename, contentType, and size are required' });
+    }
+    if (!String(contentType).includes('pdf')) {
+      return res.status(400).json({ error: 'Only PDF uploads are allowed' });
+    }
+    const sizeNum = Number(size);
+    if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
+      return res.status(400).json({ error: 'Invalid size' });
+    }
+    if (sizeNum > MAX_UPLOAD_BYTES) {
+      return res.status(413).json({ error: 'File exceeds upload limit' });
+    }
+
+    const client = ensureR2();
+    const safeName = String(filename)
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .slice(-120);
+    const key = `${req.user.uid}/${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${safeName}`;
+
+    const command = new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+      ContentType: contentType,
+      ContentLength: sizeNum,
+    });
+    const uploadUrl = await getSignedUrl(client, command, { expiresIn: R2_SIGNED_URL_TTL });
+    const publicUrl = R2_PUBLIC_BASE_URL ? `${R2_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key}` : '';
+    res.json({ key, uploadUrl, publicUrl });
+  } catch (err) {
+    console.error('Presign upload failed:', err);
+    res.status(500).json({ error: 'Failed to create upload URL' });
+  }
+});
+
+app.post('/api/uploads/signed-url', requireAuth, async (req, res) => {
+  try {
+    const { key } = req.body || {};
+    if (!key || typeof key !== 'string') {
+      return res.status(400).json({ error: 'key is required' });
+    }
+    if (!isOwnedKey(key, req.user.uid)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const client = ensureR2();
+    const command = new GetObjectCommand({ Bucket: R2_BUCKET, Key: key });
+    const url = await getSignedUrl(client, command, { expiresIn: R2_SIGNED_URL_TTL });
+    res.json({ url });
+  } catch (err) {
+    console.error('Signed URL failed:', err);
+    res.status(500).json({ error: 'Failed to create download URL' });
+  }
 });
 
 // ----- Billing (PayMongo) -----
