@@ -140,6 +140,64 @@ function isValidState(state) {
   return true;
 }
 
+const MAX_STATE_BYTES = Number(process.env.MAX_STATE_BYTES || 5 * 1024 * 1024);
+const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 1 * 1024 * 1024);
+const MAX_ATTACHMENT_BASE64_LEN = Math.ceil(MAX_ATTACHMENT_BYTES * 1.37);
+
+function sanitizeStateForStorage(state) {
+  const sanitized = JSON.parse(JSON.stringify(state));
+
+  if (Array.isArray(sanitized.tasks)) {
+    sanitized.tasks = sanitized.tasks.map(task => {
+      if (task?.pdfAttachment?.data && task.pdfAttachment.data.length > MAX_ATTACHMENT_BASE64_LEN) {
+        task.pdfAttachment.data = '';
+      }
+      return task;
+    });
+  }
+
+  if (Array.isArray(sanitized.folders)) {
+    sanitized.folders = sanitized.folders.map(folder => {
+      if (Array.isArray(folder.items)) {
+        folder.items = folder.items.map(item => {
+          if (item?.type === 'pdf' && item.content && item.content.length > MAX_ATTACHMENT_BASE64_LEN) {
+            item.content = '';
+          }
+          return item;
+        });
+      }
+      return folder;
+    });
+  }
+
+  const sizeBytes = Buffer.byteLength(JSON.stringify(sanitized), 'utf8');
+  if (sizeBytes > MAX_STATE_BYTES) {
+    if (Array.isArray(sanitized.tasks)) {
+      sanitized.tasks = sanitized.tasks.map(task => {
+        if (task?.pdfAttachment?.data) {
+          task.pdfAttachment.data = '';
+        }
+        return task;
+      });
+    }
+    if (Array.isArray(sanitized.folders)) {
+      sanitized.folders = sanitized.folders.map(folder => {
+        if (Array.isArray(folder.items)) {
+          folder.items = folder.items.map(item => {
+            if (item?.type === 'pdf' && item.content) {
+              item.content = '';
+            }
+            return item;
+          });
+        }
+        return folder;
+      });
+    }
+  }
+
+  return sanitized;
+}
+
 // ----- Routes -----
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -167,7 +225,7 @@ app.put('/api/state', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid state payload' });
     }
     const user = await getOrCreateUser(req.user.uid, req.user.email);
-    user.state = state;
+    user.state = sanitizeStateForStorage(state);
     user.email = req.user.email || user.email;
     await user.save();
     res.json({ success: true });
