@@ -15,6 +15,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const webpush = require('web-push');
+const crypto = require('crypto');
 
 const { requireAuth, requireAdmin, initFirebaseAdmin } = require('./middleware/auth');
 const { User, getDefaultState } = require('./models/User');
@@ -45,7 +46,12 @@ const apiLimiter = rateLimit({
 });
 app.use('/api', apiLimiter);
 
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({
+  limit: '15mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  },
+}));
 
 const allowedOrigins = [
   'http://localhost:3000',
@@ -110,6 +116,8 @@ async function getOrCreateUser(uid, email) {
       email: email || '',
       state: getDefaultState(),
     });
+  } else if (!user.billing) {
+    user.billing = {};
   }
   return user;
 }
@@ -198,6 +206,184 @@ function sanitizeStateForStorage(state) {
   return sanitized;
 }
 
+// ----- Billing (PayMongo) -----
+function resolveEnvRef(value) {
+  if (!value) return '';
+  const match = String(value).match(/^\$\{([^}]+)\}$/);
+  if (match) {
+    return process.env[match[1]] || '';
+  }
+  return value;
+}
+
+const PAYMONGO_SECRET_KEY = resolveEnvRef(process.env.PAYMONGO_SECRET_KEY);
+const PAYMONGO_API_BASE = process.env.PAYMONGO_API_BASE || 'https://api.paymongo.com/v1';
+const PAYMONGO_WEBHOOK_SECRET = resolveEnvRef(process.env.PAYMONGO_WEBHOOK_SECRET);
+
+const BILLING_PLANS = {
+  premium: {
+    monthly: {
+      amount: 14900,
+      currency: 'PHP',
+      label: 'Premium Monthly',
+      description: 'AcademiaZen Premium (Monthly)',
+      interval: 'monthly',
+    },
+    yearly: {
+      amount: 149000,
+      currency: 'PHP',
+      label: 'Premium Yearly',
+      description: 'AcademiaZen Premium (Yearly)',
+      interval: 'yearly',
+    },
+  },
+};
+
+const PAYMENT_METHOD_MAP = {
+  gcash: 'gcash',
+  bank: 'qrph',
+  qrph: 'qrph',
+};
+
+function getCheckoutUrls() {
+  const base = process.env.PAYMONGO_SUCCESS_URL
+    ? { success: process.env.PAYMONGO_SUCCESS_URL, cancel: process.env.PAYMONGO_CANCEL_URL }
+    : null;
+
+  if (base?.success && base?.cancel) return base;
+
+  const frontend = process.env.FRONTEND_URL || 'http://localhost:5173';
+  return {
+    success: `${frontend.replace(/\/+$/, '')}/?billing=success`,
+    cancel: `${frontend.replace(/\/+$/, '')}/?billing=cancel`,
+  };
+}
+
+function addInterval(date, interval) {
+  const next = new Date(date);
+  if (interval === 'yearly') {
+    next.setFullYear(next.getFullYear() + 1);
+  } else {
+    next.setMonth(next.getMonth() + 1);
+  }
+  return next;
+}
+
+function isBillingActive(billing) {
+  if (!billing?.currentPeriodEnd) return false;
+  const end = new Date(billing.currentPeriodEnd);
+  return billing.status === 'active' && end.getTime() > Date.now();
+}
+
+function getBillingSnapshot(billing) {
+  const active = isBillingActive(billing);
+  const plan = billing?.plan || 'free';
+  const autoRenew = plan === 'premium' ? (billing?.autoRenew ?? true) : false;
+  let status = billing?.status || 'free';
+  if (status === 'active' && !active) status = 'expired';
+  if (status === 'pending' && !billing?.pendingCheckoutId) status = 'free';
+  return {
+    plan,
+    interval: billing?.interval || 'none',
+    status,
+    currentPeriodEnd: billing?.currentPeriodEnd ? new Date(billing.currentPeriodEnd).toISOString() : null,
+    autoRenew,
+    isActive: active,
+    effectivePlan: active ? plan : 'free',
+    pendingCheckoutId: billing?.pendingCheckoutId || '',
+  };
+}
+
+function applyPaidSubscription(user, interval, details = {}) {
+  if (!user.billing) user.billing = {};
+  if (!user.billing.paymongo) user.billing.paymongo = {};
+  const now = new Date();
+  const currentEnd = user.billing?.currentPeriodEnd ? new Date(user.billing.currentPeriodEnd) : null;
+  const base = currentEnd && currentEnd > now ? currentEnd : now;
+  const nextEnd = addInterval(base, interval);
+
+  user.billing.plan = 'premium';
+  user.billing.interval = interval;
+  user.billing.status = 'active';
+  user.billing.currentPeriodEnd = nextEnd;
+  user.billing.lastPaymentAt = now;
+  user.billing.pendingCheckoutId = '';
+  user.billing.pendingPlan = '';
+  user.billing.pendingInterval = '';
+
+  if (details.checkoutId) user.billing.paymongo.checkoutId = details.checkoutId;
+  if (details.paymentId) user.billing.paymongo.paymentId = details.paymentId;
+  if (details.paymentIntentId) user.billing.paymongo.paymentIntentId = details.paymentIntentId;
+  if (details.sourceId) user.billing.paymongo.sourceId = details.sourceId;
+  if (details.eventId) user.billing.paymongo.lastEventId = details.eventId;
+  if (details.eventType) user.billing.paymongo.lastEventType = details.eventType;
+}
+
+function buildPaymongoAuthHeader() {
+  const token = Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64');
+  return `Basic ${token}`;
+}
+
+async function paymongoRequest(path, { method = 'GET', body } = {}) {
+  if (!PAYMONGO_SECRET_KEY) {
+    throw new Error('PAYMONGO_SECRET_KEY is not configured');
+  }
+
+  const response = await fetch(`${PAYMONGO_API_BASE}${path}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: buildPaymongoAuthHeader(),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data?.errors?.[0]?.detail || data?.errors?.[0]?.message || 'PayMongo request failed';
+    const error = new Error(message);
+    error.statusCode = response.status;
+    error.payload = data;
+    throw error;
+  }
+  return data;
+}
+
+function verifyPaymongoSignature(req) {
+  if (!PAYMONGO_WEBHOOK_SECRET) return true;
+  const header = req.headers['paymongo-signature'];
+  if (!header || !req.rawBody) return false;
+
+  const raw = req.rawBody.toString('utf8');
+  const parts = String(header).split(',').map(p => p.trim());
+  let timestamp = null;
+  const signatures = [];
+  for (const part of parts) {
+    if (part.startsWith('t=')) timestamp = part.slice(2);
+    if (part.startsWith('v1=')) signatures.push(part.slice(3));
+    if (part.startsWith('sig=')) signatures.push(part.slice(4));
+  }
+  if (!signatures.length && header) signatures.push(String(header).trim());
+
+  const candidates = [];
+  if (timestamp) {
+    candidates.push(crypto.createHmac('sha256', PAYMONGO_WEBHOOK_SECRET).update(`${timestamp}.${raw}`).digest('hex'));
+  }
+  candidates.push(crypto.createHmac('sha256', PAYMONGO_WEBHOOK_SECRET).update(raw).digest('hex'));
+
+  return signatures.some(sig => candidates.includes(sig));
+}
+
+function isCheckoutPaid(checkout) {
+  const attrs = checkout?.data?.attributes;
+  if (!attrs) return false;
+  if (attrs.payment_status && String(attrs.payment_status).toLowerCase() === 'paid') return true;
+  if (Array.isArray(attrs.payments)) {
+    return attrs.payments.some(p => String(p?.attributes?.status || '').toLowerCase() === 'paid');
+  }
+  return false;
+}
+
 // ----- Routes -----
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -205,6 +391,181 @@ app.get('/health', (req, res) => {
 
 app.get('/api/vapid-public-key', (req, res) => {
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
+});
+
+// ----- Billing (PayMongo) -----
+app.get('/api/billing/plans', requireAuth, (req, res) => {
+  res.json({
+    plans: {
+      free: { id: 'free', label: 'Freemium', amount: 0, currency: 'PHP', interval: 'none' },
+      premium: BILLING_PLANS.premium,
+    },
+  });
+});
+
+app.get('/api/billing/status', requireAuth, async (req, res) => {
+  try {
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    res.json({ billing: getBillingSnapshot(user.billing || {}) });
+  } catch (err) {
+    console.error('Failed to get billing status:', err);
+    res.status(500).json({ error: 'Failed to load billing status' });
+  }
+});
+
+app.post('/api/billing/auto-renew', requireAuth, async (req, res) => {
+  try {
+    const { autoRenew } = req.body || {};
+    if (typeof autoRenew !== 'boolean') {
+      return res.status(400).json({ error: 'autoRenew must be a boolean' });
+    }
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    user.billing.autoRenew = autoRenew;
+    await user.save();
+    res.json({ success: true, autoRenew });
+  } catch (err) {
+    console.error('Failed to update auto-renew:', err);
+    res.status(500).json({ error: 'Failed to update auto-renew' });
+  }
+});
+
+app.post('/api/billing/checkout', requireAuth, async (req, res) => {
+  try {
+    const { plan = 'premium', interval = 'monthly', method = 'gcash' } = req.body || {};
+    const planConfig = BILLING_PLANS[plan]?.[interval];
+    const paymentMethod = PAYMENT_METHOD_MAP[method];
+
+    if (!planConfig) {
+      return res.status(400).json({ error: 'Invalid plan or interval' });
+    }
+    if (!paymentMethod) {
+      return res.status(400).json({ error: 'Invalid payment method' });
+    }
+
+    const { success, cancel } = getCheckoutUrls();
+
+    const payload = {
+      data: {
+        attributes: {
+          line_items: [
+            {
+              name: planConfig.label,
+              amount: planConfig.amount,
+              currency: planConfig.currency,
+              quantity: 1,
+              description: planConfig.description,
+            },
+          ],
+          payment_method_types: [paymentMethod],
+          success_url: success,
+          cancel_url: cancel,
+          description: planConfig.description,
+          send_email_receipt: true,
+          show_description: true,
+          show_line_items: true,
+          metadata: {
+            uid: req.user.uid,
+            email: req.user.email || '',
+            plan,
+            interval,
+            method: paymentMethod,
+          },
+        },
+      },
+    };
+
+    const response = await paymongoRequest('/checkout_sessions', { method: 'POST', body: payload });
+    const checkoutUrl = response?.data?.attributes?.checkout_url;
+    const checkoutId = response?.data?.id;
+
+    if (!checkoutUrl || !checkoutId) {
+      return res.status(502).json({ error: 'Invalid response from payment provider' });
+    }
+
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    user.billing.plan = plan;
+    user.billing.interval = interval;
+    user.billing.status = 'pending';
+    user.billing.pendingCheckoutId = checkoutId;
+    user.billing.pendingPlan = plan;
+    user.billing.pendingInterval = interval;
+    user.billing.paymongo.checkoutId = checkoutId;
+    user.billing.paymongo.lastEventType = 'checkout.created';
+    await user.save();
+
+    res.json({ checkoutUrl, checkoutId });
+  } catch (err) {
+    console.error('Checkout creation failed:', err);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+app.post('/api/billing/refresh', requireAuth, async (req, res) => {
+  try {
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    const checkoutId = user.billing?.pendingCheckoutId;
+    if (!checkoutId) {
+      return res.json({ updated: false, billing: getBillingSnapshot(user.billing || {}) });
+    }
+
+    const checkout = await paymongoRequest(`/checkout_sessions/${checkoutId}`, { method: 'GET' });
+    if (isCheckoutPaid(checkout)) {
+      const interval = user.billing.pendingInterval || user.billing.interval || 'monthly';
+      const paymentId = checkout?.data?.attributes?.payments?.[0]?.id;
+      applyPaidSubscription(user, interval, { checkoutId, paymentId });
+      await user.save();
+      return res.json({ updated: true, billing: getBillingSnapshot(user.billing || {}) });
+    }
+
+    res.json({ updated: false, billing: getBillingSnapshot(user.billing || {}) });
+  } catch (err) {
+    console.error('Billing refresh failed:', err);
+    res.status(500).json({ error: 'Failed to refresh billing' });
+  }
+});
+
+app.post('/api/billing/webhook/paymongo', async (req, res) => {
+  try {
+    if (!verifyPaymongoSignature(req)) {
+      return res.status(400).json({ error: 'Invalid signature' });
+    }
+
+    const event = req.body?.data;
+    const eventType = event?.attributes?.type;
+    const eventId = event?.id;
+    const resource = event?.attributes?.data;
+    const checkoutId = resource?.id;
+
+    if (!eventType || !checkoutId) {
+      return res.json({ received: true });
+    }
+
+    const user = await User.findOne({ 'billing.pendingCheckoutId': checkoutId })
+      || await User.findOne({ 'billing.paymongo.checkoutId': checkoutId });
+
+    if (!user) {
+      return res.json({ received: true });
+    }
+    if (!user.billing) user.billing = {};
+    if (!user.billing.paymongo) user.billing.paymongo = {};
+
+    if (String(eventType).includes('payment.paid')) {
+      const interval = user.billing.pendingInterval || user.billing.interval || 'monthly';
+      const paymentId = resource?.attributes?.payments?.[0]?.id;
+      applyPaidSubscription(user, interval, { checkoutId, paymentId, eventId, eventType });
+      await user.save();
+    } else if (String(eventType).includes('payment.failed')) {
+      user.billing.status = 'past_due';
+      user.billing.paymongo.lastEventId = eventId || '';
+      user.billing.paymongo.lastEventType = eventType || '';
+      await user.save();
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('PayMongo webhook failed:', err);
+    res.status(500).json({ error: 'Webhook handling failed' });
+  }
 });
 
 // --- Auth-protected ---
@@ -422,6 +783,11 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
     const { prompt } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required' });
+    }
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    if (!hasPremium) {
+      return res.status(402).json({ error: 'Premium subscription required' });
     }
     if (!process.env.GEMINI_API_KEY) {
       return res.status(500).json({ error: 'AI API key is not configured' });

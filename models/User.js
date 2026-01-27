@@ -59,6 +59,27 @@ const AppSettingsSchema = new mongoose.Schema({
   studyReminders: { type: Boolean, default: true },
 }, { _id: false });
 
+const BillingSchema = new mongoose.Schema({
+  plan: { type: String, enum: ['free', 'premium'], default: 'free' },
+  interval: { type: String, enum: ['none', 'monthly', 'yearly'], default: 'none' },
+  status: { type: String, enum: ['free', 'pending', 'active', 'canceled', 'expired', 'past_due'], default: 'free' },
+  currentPeriodEnd: { type: Date, default: null },
+  autoRenew: { type: Boolean, default: true },
+  provider: { type: String, default: 'paymongo' },
+  lastPaymentAt: { type: Date, default: null },
+  pendingCheckoutId: { type: String, default: '' },
+  pendingPlan: { type: String, default: '' },
+  pendingInterval: { type: String, default: '' },
+  paymongo: {
+    checkoutId: { type: String, default: '' },
+    paymentId: { type: String, default: '' },
+    paymentIntentId: { type: String, default: '' },
+    sourceId: { type: String, default: '' },
+    lastEventId: { type: String, default: '' },
+    lastEventType: { type: String, default: '' },
+  },
+}, { _id: false });
+
 const ZenStateSchema = new mongoose.Schema({
   tasks: { type: [TaskSchema], default: [] },
   subjects: { type: [SubjectSchema], default: [] },
@@ -72,6 +93,7 @@ const UserSchema = new mongoose.Schema({
   uid: { type: String, required: true, unique: true, index: true },
   email: { type: String, default: '' },
   state: { type: ZenStateSchema, default: () => getDefaultState() },
+  billing: { type: BillingSchema, default: () => ({}) },
 }, { timestamps: true });
 
 function getDefaultState() {
