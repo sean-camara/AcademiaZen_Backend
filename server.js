@@ -32,6 +32,7 @@ const app = express();
 
 // Trust proxy for rate limiting and correct IPs behind Nginx
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
 
 // ----- Security / middleware -----
 app.use(helmet({
@@ -45,6 +46,13 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 app.use('/api', apiLimiter);
+
+const checkoutLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 app.use(express.json({
   limit: '15mb',
@@ -371,7 +379,17 @@ function verifyPaymongoSignature(req) {
   }
   candidates.push(crypto.createHmac('sha256', PAYMONGO_WEBHOOK_SECRET).update(raw).digest('hex'));
 
-  return signatures.some(sig => candidates.includes(sig));
+  return signatures.some(sig => {
+    try {
+      const sigBuf = Buffer.from(String(sig).trim(), 'hex');
+      return candidates.some(candidate => {
+        const candBuf = Buffer.from(candidate, 'hex');
+        return sigBuf.length === candBuf.length && crypto.timingSafeEqual(sigBuf, candBuf);
+      });
+    } catch (_) {
+      return false;
+    }
+  });
 }
 
 function isCheckoutPaid(checkout) {
@@ -429,7 +447,7 @@ app.post('/api/billing/auto-renew', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/billing/checkout', requireAuth, async (req, res) => {
+app.post('/api/billing/checkout', requireAuth, checkoutLimiter, async (req, res) => {
   try {
     const { plan = 'premium', interval = 'monthly', method = 'gcash' } = req.body || {};
     const planConfig = BILLING_PLANS[plan]?.[interval];
