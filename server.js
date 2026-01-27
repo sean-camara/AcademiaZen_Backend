@@ -246,6 +246,8 @@ const AI_BASE_URL = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
 const AI_MODEL_DEFAULT = process.env.AI_MODEL || 'deepseek/deepseek-r1-0528:free';
 const AI_MODEL_FAST = process.env.AI_MODEL_FAST || 'deepseek/deepseek-chat';
 const AI_MODEL_DEEP = process.env.AI_MODEL_DEEP || AI_MODEL_DEFAULT;
+const AI_MAX_TOKENS_FAST = Number(process.env.AI_MAX_TOKENS_FAST || 1200);
+const AI_MAX_TOKENS_DEEP = Number(process.env.AI_MAX_TOKENS_DEEP || 2400);
 const OPENROUTER_API_KEY = resolveEnvRef(process.env.OPENROUTER_API_KEY || process.env.DEEPSEEK_API_KEY);
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || process.env.FRONTEND_URL || 'https://academiazen.app';
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || 'AcademiaZen';
@@ -965,9 +967,13 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
         return res.status(402).json({ error: 'Premium subscription required' });
       }
     }
-    const selectedModel = mode === 'deep' ? AI_MODEL_DEEP : AI_MODEL_FAST;
+    const isDeep = mode === 'deep';
+    const selectedModel = isDeep ? AI_MODEL_DEEP : AI_MODEL_FAST;
+    const maxTokens = isDeep ? AI_MAX_TOKENS_DEEP : AI_MAX_TOKENS_FAST;
     const payload = {
       model: selectedModel,
+      max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1200,
+      temperature: isDeep ? 0.2 : 0.5,
       messages: [
         { role: 'user', content: prompt },
       ],
@@ -978,6 +984,10 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
     res.json({ text });
   } catch (err) {
     console.error('AI proxy error:', err);
+    const status = err?.statusCode || 500;
+    if (status === 402) {
+      return res.status(402).json({ error: 'AI credits exhausted or token limit exceeded' });
+    }
     res.status(500).json({ error: 'AI request failed' });
   }
 });
