@@ -907,9 +907,16 @@ app.post('/api/notify-new-task', requireAuth, async (req, res) => {
     timeText = `in ${daysUntilDue} days`;
   }
 
+  const dueDisplay = dueDate.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
   const payload = JSON.stringify({
     title: `${urgencyEmoji} New Task Added`,
-    body: `"${task.title}" is due ${timeText}`,
+    body: `"${task.title}" is due ${timeText} (${dueDisplay})`,
     icon: '/icons/icon-192x192.svg',
     badge: '/icons/icon-72x72.svg',
     url: '/?page=home',
@@ -1028,9 +1035,16 @@ async function checkTaskDeadlines() {
           timeText = `in ${daysUntilDue} days`;
         }
 
+        const dueDisplay = dueDate.toLocaleString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+        });
         const payload = JSON.stringify({
           title: `${urgencyEmoji} Task Reminder`,
-          body: `"${task.title}" is due ${timeText}`,
+          body: `"${task.title}" is due ${timeText} (${dueDisplay})`,
           icon: '/icons/icon-192x192.svg',
           badge: '/icons/icon-72x72.svg',
           url: '/?page=home',
