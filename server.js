@@ -21,6 +21,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const { requireAuth, requireAdmin, initFirebaseAdmin } = require('./middleware/auth');
 const { User, getDefaultState } = require('./models/User');
+const { FocusSession } = require('./models/FocusSession');
 const PushSubscription = require('./models/PushSubscription');
 
 const app = express();
@@ -364,6 +365,38 @@ function getBillingSnapshot(billing) {
     effectivePlan: active ? plan : 'free',
     pendingCheckoutId: billing?.pendingCheckoutId || '',
   };
+}
+
+async function getFocusStreak(uid) {
+  const sessions = await FocusSession.find({
+    uid,
+    status: { $in: ['completed', 'failed', 'abandoned'] },
+    endedAt: { $ne: null },
+  })
+    .sort({ endedAt: -1 })
+    .limit(50)
+    .lean();
+
+  let streak = 0;
+  for (const session of sessions) {
+    if (session.status === 'completed') {
+      streak += 1;
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
+async function getTargetQuitCount(uid, targetType, targetId, days = 7) {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  return FocusSession.countDocuments({
+    uid,
+    targetType,
+    targetId,
+    status: { $in: ['failed', 'abandoned'] },
+    endedAt: { $gte: since },
+  });
 }
 
 function applyPaidSubscription(user, interval, details = {}) {
@@ -715,6 +748,150 @@ app.post('/api/billing/refresh', requireAuth, async (req, res) => {
   }
 });
 
+// ----- Focus Sessions -----
+app.get('/api/focus/summary', requireAuth, async (req, res) => {
+  try {
+    const { targetType, targetId } = req.query || {};
+    if (!targetType || !targetId) {
+      return res.status(400).json({ error: 'targetType and targetId are required' });
+    }
+    const sessions = await FocusSession.find({
+      uid: req.user.uid,
+      targetType,
+      targetId,
+      endedAt: { $ne: null },
+    })
+      .sort({ endedAt: -1 })
+      .limit(10)
+      .lean();
+
+    const total = sessions.length;
+    const completed = sessions.filter(s => s.status === 'completed').length;
+    const successRate = total ? completed / total : 0;
+    const lastSession = sessions[0]
+      ? {
+          status: sessions[0].status,
+          plannedDurationMinutes: sessions[0].plannedDurationMinutes || 0,
+        }
+      : null;
+    const streak = await getFocusStreak(req.user.uid);
+    const quitCount7d = await getTargetQuitCount(req.user.uid, targetType, targetId, 7);
+
+    res.json({
+      successRate,
+      totalSessions: total,
+      completedSessions: completed,
+      lastSession,
+      streak,
+      quitCount7d,
+    });
+  } catch (err) {
+    console.error('Failed to load focus summary:', err);
+    res.status(500).json({ error: 'Failed to load focus summary' });
+  }
+});
+
+app.post('/api/focus/sessions/start', requireAuth, async (req, res) => {
+  try {
+    const {
+      targetType,
+      targetId,
+      targetLabel = '',
+      targetMeta = {},
+      plannedDurationMinutes,
+    } = req.body || {};
+
+    if (!targetType || !targetId || !plannedDurationMinutes) {
+      return res.status(400).json({ error: 'targetType, targetId and plannedDurationMinutes are required' });
+    }
+
+    await FocusSession.updateMany(
+      { uid: req.user.uid, status: 'in_progress' },
+      { status: 'abandoned', endedAt: new Date(), reflectionType: 'blocked', reflectionText: 'Session abandoned by new start.' }
+    );
+
+    const session = await FocusSession.create({
+      uid: req.user.uid,
+      status: 'in_progress',
+      targetType,
+      targetId,
+      targetLabel,
+      targetMeta,
+      plannedDurationMinutes,
+      startedAt: new Date(),
+    });
+
+    res.json({ sessionId: session._id.toString(), startedAt: session.startedAt });
+  } catch (err) {
+    console.error('Failed to start focus session:', err);
+    res.status(500).json({ error: 'Failed to start focus session' });
+  }
+});
+
+app.post('/api/focus/sessions/complete', requireAuth, async (req, res) => {
+  try {
+    const { sessionId, reflectionText } = req.body || {};
+    if (!sessionId || !reflectionText) {
+      return res.status(400).json({ error: 'sessionId and reflectionText are required' });
+    }
+    const session = await FocusSession.findOne({ _id: sessionId, uid: req.user.uid });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (session.status !== 'in_progress') {
+      return res.status(400).json({ error: 'Session is not active' });
+    }
+
+    const endedAt = new Date();
+    session.status = 'completed';
+    session.endedAt = endedAt;
+    session.actualDurationSeconds = session.startedAt ? Math.max(1, Math.round((endedAt - session.startedAt) / 1000)) : 0;
+    session.reflectionType = 'finished';
+    session.reflectionText = reflectionText;
+    await session.save();
+
+    if (session.targetType === 'task') {
+      const user = await getOrCreateUser(req.user.uid, req.user.email);
+      user.state.tasks = (user.state.tasks || []).map(task =>
+        task.id === session.targetId ? { ...task, completed: true } : task
+      );
+      await user.save();
+    }
+
+    const streak = await getFocusStreak(req.user.uid);
+    res.json({ success: true, streak });
+  } catch (err) {
+    console.error('Failed to complete focus session:', err);
+    res.status(500).json({ error: 'Failed to complete focus session' });
+  }
+});
+
+app.post('/api/focus/sessions/abandon', requireAuth, async (req, res) => {
+  try {
+    const { sessionId, reflectionText } = req.body || {};
+    if (!sessionId || !reflectionText) {
+      return res.status(400).json({ error: 'sessionId and reflectionText are required' });
+    }
+    const session = await FocusSession.findOne({ _id: sessionId, uid: req.user.uid });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (session.status !== 'in_progress') {
+      return res.status(400).json({ error: 'Session is not active' });
+    }
+
+    const endedAt = new Date();
+    session.status = 'abandoned';
+    session.endedAt = endedAt;
+    session.actualDurationSeconds = session.startedAt ? Math.max(1, Math.round((endedAt - session.startedAt) / 1000)) : 0;
+    session.reflectionType = 'blocked';
+    session.reflectionText = reflectionText;
+    await session.save();
+
+    const quitCount7d = await getTargetQuitCount(req.user.uid, session.targetType, session.targetId, 7);
+    res.json({ success: true, quitCount7d, showQuitWarning: quitCount7d >= 3 });
+  } catch (err) {
+    console.error('Failed to abandon focus session:', err);
+    res.status(500).json({ error: 'Failed to abandon focus session' });
+  }
+});
+
 app.post('/api/billing/webhook/paymongo', async (req, res) => {
   try {
     if (!verifyPaymongoSignature(req)) {
@@ -792,6 +969,7 @@ app.delete('/api/account', requireAuth, async (req, res) => {
     await Promise.all([
       User.deleteOne({ uid: req.user.uid }),
       PushSubscription.deleteMany({ uid: req.user.uid }),
+      FocusSession.deleteMany({ uid: req.user.uid }),
     ]);
     res.json({ success: true });
   } catch (err) {
