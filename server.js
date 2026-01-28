@@ -343,7 +343,8 @@ function addInterval(date, interval) {
 function isBillingActive(billing) {
   if (!billing?.currentPeriodEnd) return false;
   const end = new Date(billing.currentPeriodEnd);
-  return billing.status === 'active' && end.getTime() > Date.now();
+  const status = billing?.status;
+  return (status === 'active' || status === 'canceled') && end.getTime() > Date.now();
 }
 
 function getBillingSnapshot(billing) {
@@ -351,7 +352,7 @@ function getBillingSnapshot(billing) {
   const plan = billing?.plan || 'free';
   const autoRenew = plan === 'premium' ? (billing?.autoRenew ?? true) : false;
   let status = billing?.status || 'free';
-  if (status === 'active' && !active) status = 'expired';
+  if ((status === 'active' || status === 'canceled') && !active) status = 'expired';
   if (status === 'pending' && !billing?.pendingCheckoutId) status = 'free';
   return {
     plan,
@@ -599,6 +600,23 @@ app.post('/api/billing/auto-renew', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('Failed to update auto-renew:', err);
     res.status(500).json({ error: 'Failed to update auto-renew' });
+  }
+});
+
+app.post('/api/billing/cancel', requireAuth, async (req, res) => {
+  try {
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    if (!user.billing || user.billing.plan !== 'premium') {
+      return res.status(400).json({ error: 'No active subscription to cancel' });
+    }
+    user.billing.status = 'canceled';
+    user.billing.autoRenew = false;
+    user.billing.canceledAt = new Date();
+    await user.save();
+    res.json({ success: true, billing: getBillingSnapshot(user.billing) });
+  } catch (err) {
+    console.error('Failed to cancel subscription:', err);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
   }
 });
 
