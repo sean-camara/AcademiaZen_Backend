@@ -907,21 +907,23 @@ app.post('/api/notify-new-task', requireAuth, async (req, res) => {
     timeText = `in ${daysUntilDue} days`;
   }
 
-  const dueDisplay = dueDate.toLocaleString('en-US', {
+  const dueDisplay = `${dueDate.toLocaleDateString('en-US', {
     month: 'short',
     day: 'numeric',
     year: 'numeric',
+  })} at ${dueDate.toLocaleTimeString('en-US', {
     hour: 'numeric',
     minute: '2-digit',
-  });
+  })}`;
+  const subjectParam = task.subjectId ? `&subject=${encodeURIComponent(task.subjectId)}` : '';
   const payload = JSON.stringify({
-    title: `${urgencyEmoji} New Task Added`,
-    body: `"${task.title}" is due ${timeText} (${dueDisplay})`,
+    title: task.title,
+    body: `Is due ${timeText} (${dueDisplay})`,
     icon: '/icons/icon-192x192.svg',
     badge: '/icons/icon-72x72.svg',
-    url: '/?page=home',
+    url: `/?page=home${subjectParam}`,
     tag: `new-task-${task.id}`,
-    data: { taskId: task.id },
+    data: { taskId: task.id, subjectId: task.subjectId },
   });
 
   try {
@@ -1035,21 +1037,23 @@ async function checkTaskDeadlines() {
           timeText = `in ${daysUntilDue} days`;
         }
 
-        const dueDisplay = dueDate.toLocaleString('en-US', {
+        const dueDisplay = `${dueDate.toLocaleDateString('en-US', {
           month: 'short',
           day: 'numeric',
           year: 'numeric',
+        })} at ${dueDate.toLocaleTimeString('en-US', {
           hour: 'numeric',
           minute: '2-digit',
-        });
+        })}`;
+        const subjectParam = task.subjectId ? `&subject=${encodeURIComponent(task.subjectId)}` : '';
         const payload = JSON.stringify({
-          title: `${urgencyEmoji} Task Reminder`,
-          body: `"${task.title}" is due ${timeText} (${dueDisplay})`,
+          title: task.title,
+          body: `Is due ${timeText} (${dueDisplay})`,
           icon: '/icons/icon-192x192.svg',
           badge: '/icons/icon-72x72.svg',
-          url: '/?page=home',
+          url: `/?page=home${subjectParam}`,
           tag: `task-reminder-${task.id}`,
-          data: { taskId: task.id },
+          data: { taskId: task.id, subjectId: task.subjectId },
         });
 
         await sendNotificationToUser(user.uid, payload);
