@@ -11,7 +11,7 @@ const FocusSessionSchema = new mongoose.Schema({
   actualDurationSeconds: { type: Number, default: 0 },
   startedAt: { type: Date, default: null },
   endedAt: { type: Date, default: null },
-  reflectionType: { type: String, enum: ['finished', 'blocked'], default: '' },
+  reflectionType: { type: String, enum: ['finished', 'blocked', null], default: null },
   reflectionText: { type: String, default: '' },
 }, { timestamps: true });
 
