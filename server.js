@@ -239,7 +239,7 @@ const PAYMONGO_SECRET_KEY = resolveEnvRef(process.env.PAYMONGO_SECRET_KEY);
 const PAYMONGO_API_BASE = process.env.PAYMONGO_API_BASE || 'https://api.paymongo.com/v1';
 const PAYMONGO_WEBHOOK_SECRET = resolveEnvRef(process.env.PAYMONGO_WEBHOOK_SECRET);
 
-const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
+const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'premium').toLowerCase();
 const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
 const MAX_AI_PROMPT_CHARS = Number(process.env.MAX_AI_PROMPT_CHARS || 12000);
 const AI_BASE_URL = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
