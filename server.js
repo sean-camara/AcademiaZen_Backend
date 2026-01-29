@@ -1422,14 +1422,25 @@ app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) =
     // Parse the JSON response
     let parsed;
     try {
-      // Try to extract JSON from the response
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+      // Remove markdown code blocks if present
+      let cleanedText = responseText.trim();
+      
+      // Remove ```json or ``` wrappers
+      if (cleanedText.startsWith('```')) {
+        cleanedText = cleanedText.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '');
+      }
+      
+      // Try to extract JSON from the cleaned response
+      const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
+        console.error('No JSON found in AI response:', responseText.substring(0, 500));
         throw new Error('No JSON found in response');
       }
+      
       parsed = JSON.parse(jsonMatch[0]);
     } catch (parseErr) {
-      console.error('Failed to parse AI response:', parseErr, responseText);
+      console.error('Failed to parse AI response:', parseErr);
+      console.error('Response text:', responseText.substring(0, 1000));
       return res.status(500).json({ error: "We're sorry, something went wrong while generating your reviewer. Please try again." });
     }
 
