@@ -50,6 +50,56 @@ const FolderSchema = new mongoose.Schema({
   items: { type: [FolderItemSchema], default: [] },
 }, { _id: false });
 
+// AI Reviewer Schemas
+const MatchingPairSchema = new mongoose.Schema({
+  id: { type: String, required: true },
+  left: { type: String, default: '' },
+  right: { type: String, default: '' },
+}, { _id: false });
+
+const ReviewerQuestionSchema = new mongoose.Schema({
+  id: { type: String, required: true },
+  type: { type: String, enum: ['identification', 'multiple_choice', 'true_false', 'word_matching'], required: true },
+  question: { type: String, default: '' },
+  options: { type: [String], default: [] },
+  correctAnswer: { type: String, default: '' },
+  pairs: { type: [MatchingPairSchema], default: [] },
+}, { _id: false });
+
+const QuizAttemptSchema = new mongoose.Schema({
+  id: { type: String, required: true },
+  score: { type: Number, default: 0 },
+  totalQuestions: { type: Number, default: 0 },
+  correctAnswers: { type: Number, default: 0 },
+  timeTaken: { type: Number, default: 0 },
+  completedAt: { type: String, default: '' },
+}, { _id: false });
+
+const AIReviewerSchema = new mongoose.Schema({
+  id: { type: String, required: true },
+  name: { type: String, default: '' },
+  sourceId: { type: String, default: '' },
+  sourceFolderId: { type: String, default: '' },
+  sourceName: { type: String, default: '' },
+  difficulty: { type: String, enum: ['easy', 'medium', 'hard'], default: 'medium' },
+  questionCount: { type: Number, default: 10 },
+  questionMode: { type: String, enum: ['identification', 'multiple_choice', 'true_false', 'word_matching', 'hybrid'], default: 'hybrid' },
+  timerMinutes: { type: Number, default: null },
+  questions: { type: [ReviewerQuestionSchema], default: [] },
+  createdAt: { type: String, default: '' },
+  attempts: { type: [QuizAttemptSchema], default: [] },
+  status: { type: String, enum: ['generating', 'ready', 'error'], default: 'generating' },
+  errorMessage: { type: String, default: '' },
+}, { _id: false });
+
+const QuizProgressSchema = new mongoose.Schema({
+  reviewerId: { type: String, default: '' },
+  currentIndex: { type: Number, default: 0 },
+  answers: { type: mongoose.Schema.Types.Mixed, default: {} },
+  startedAt: { type: String, default: '' },
+  timeRemaining: { type: Number, default: null },
+}, { _id: false });
+
 const UserProfileSchema = new mongoose.Schema({
   name: { type: String, default: 'Student' },
   university: { type: String, default: '' },
@@ -93,6 +143,8 @@ const ZenStateSchema = new mongoose.Schema({
   subjects: { type: [SubjectSchema], default: [] },
   flashcards: { type: [FlashcardSchema], default: [] },
   folders: { type: [FolderSchema], default: [] },
+  aiReviewers: { type: [AIReviewerSchema], default: [] },
+  quizProgress: { type: QuizProgressSchema, default: null },
   profile: { type: UserProfileSchema, default: () => ({}) },
   settings: { type: AppSettingsSchema, default: () => ({}) },
 }, { _id: false });
@@ -112,6 +164,8 @@ function getDefaultState() {
     folders: [
       { id: 'general', name: 'General', items: [] },
     ],
+    aiReviewers: [],
+    quizProgress: null,
     profile: {
       name: 'Student',
       university: '',

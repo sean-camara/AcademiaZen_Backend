@@ -1292,6 +1292,172 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
   }
 });
 
+// ----- AI Reviewer Generation -----
+const MAX_AI_REVIEWERS = 10;
+const AI_REVIEWER_MAX_TOKENS = 8000;
+
+function buildReviewerPrompt(pdfText, config) {
+  const { questionCount, difficulty, questionMode } = config;
+  
+  let questionTypeInstructions = '';
+  if (questionMode === 'identification') {
+    questionTypeInstructions = `Generate ONLY identification questions where the user must type the answer.`;
+  } else if (questionMode === 'multiple_choice') {
+    questionTypeInstructions = `Generate ONLY multiple choice questions with 4 options (A, B, C, D).`;
+  } else if (questionMode === 'true_false') {
+    questionTypeInstructions = `Generate ONLY true/false questions.`;
+  } else if (questionMode === 'word_matching') {
+    questionTypeInstructions = `Generate ONLY word matching questions with 4-5 pairs each where users match terms to their definitions/meanings.`;
+  } else {
+    // hybrid - random distribution
+    questionTypeInstructions = `Generate a MIX of question types: identification (type answer), multiple choice (A/B/C/D), true/false, and word matching (match terms to definitions). Randomly distribute the types.`;
+  }
+
+  const difficultyInstructions = {
+    easy: 'Questions should be straightforward and test basic recall and understanding.',
+    medium: 'Questions should require moderate understanding and some application of concepts.',
+    hard: 'Questions should be challenging, requiring deep understanding, analysis, and critical thinking.'
+  };
+
+  return `You are an expert quiz generator for educational content. Based on the following PDF content, generate exactly ${questionCount} quiz questions.
+
+${questionTypeInstructions}
+
+Difficulty Level: ${difficulty.toUpperCase()}
+${difficultyInstructions[difficulty]}
+
+IMPORTANT RULES:
+1. Questions must be based ONLY on the provided content
+2. Each question must have a clear, unambiguous correct answer
+3. For identification questions, the answer should be a single word or short phrase
+4. For multiple choice, always provide exactly 4 options labeled A, B, C, D
+5. For true/false, the statement must be clearly true or false based on the content
+6. For word matching, provide 4-5 pairs of terms and their matching definitions
+
+OUTPUT FORMAT (JSON array):
+[
+  {
+    "type": "identification",
+    "question": "What is the term for...?",
+    "correctAnswer": "answer"
+  },
+  {
+    "type": "multiple_choice",
+    "question": "Which of the following...?",
+    "options": ["A. Option 1", "B. Option 2", "C. Option 3", "D. Option 4"],
+    "correctAnswer": "A"
+  },
+  {
+    "type": "true_false",
+    "question": "Statement to evaluate as true or false",
+    "correctAnswer": "true"
+  },
+  {
+    "type": "word_matching",
+    "question": "Match the following terms with their definitions:",
+    "pairs": [
+      {"id": "1", "left": "Term 1", "right": "Definition 1"},
+      {"id": "2", "left": "Term 2", "right": "Definition 2"},
+      {"id": "3", "left": "Term 3", "right": "Definition 3"},
+      {"id": "4", "left": "Term 4", "right": "Definition 4"}
+    ]
+  }
+]
+
+Also, suggest a short name (2-4 words) for this reviewer based on the main topic of the content.
+
+PDF CONTENT:
+${pdfText.slice(0, 10000)}
+
+Respond with ONLY valid JSON in this format:
+{
+  "suggestedName": "Topic Name",
+  "questions": [array of questions as shown above]
+}`;
+}
+
+app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) => {
+  try {
+    const { pdfText, config, reviewerId } = req.body;
+    
+    if (!pdfText || typeof pdfText !== 'string') {
+      return res.status(400).json({ error: 'PDF text is required' });
+    }
+    
+    if (!pdfText.trim() || pdfText.trim().length < 100) {
+      return res.status(400).json({ error: "This PDF doesn't contain readable text. Please try a different PDF." });
+    }
+    
+    if (!config || !config.questionCount || !config.difficulty || !config.questionMode) {
+      return res.status(400).json({ error: 'Invalid configuration' });
+    }
+
+    // Check premium status
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    if (!hasPremium) {
+      return res.status(402).json({ error: 'Premium subscription required for AI Reviewers' });
+    }
+
+    // Check reviewer limit
+    const existingReviewers = user.state?.aiReviewers || [];
+    if (existingReviewers.length >= MAX_AI_REVIEWERS) {
+      return res.status(400).json({ error: `You've reached the maximum of ${MAX_AI_REVIEWERS} reviewers. Please delete some to create new ones.` });
+    }
+
+    const prompt = buildReviewerPrompt(pdfText, config);
+    
+    const payload = {
+      model: AI_MODEL_DEEP,
+      max_tokens: AI_REVIEWER_MAX_TOKENS,
+      temperature: 0.3,
+      messages: [
+        { role: 'user', content: prompt },
+      ],
+    };
+
+    const data = await openrouterRequest('/chat/completions', { method: 'POST', body: payload });
+    const responseText = data?.choices?.[0]?.message?.content || '';
+    
+    // Parse the JSON response
+    let parsed;
+    try {
+      // Try to extract JSON from the response
+      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        throw new Error('No JSON found in response');
+      }
+      parsed = JSON.parse(jsonMatch[0]);
+    } catch (parseErr) {
+      console.error('Failed to parse AI response:', parseErr, responseText);
+      return res.status(500).json({ error: "We're sorry, something went wrong while generating your reviewer. Please try again." });
+    }
+
+    if (!parsed.questions || !Array.isArray(parsed.questions)) {
+      return res.status(500).json({ error: "We're sorry, the AI couldn't generate proper questions. Please try again." });
+    }
+
+    // Add IDs to questions
+    const questions = parsed.questions.map((q, idx) => ({
+      id: `q_${Date.now()}_${idx}`,
+      ...q
+    }));
+
+    res.json({
+      suggestedName: parsed.suggestedName || 'AI Reviewer',
+      questions
+    });
+
+  } catch (err) {
+    console.error('AI reviewer generation error:', err);
+    const status = err?.statusCode || 500;
+    if (status === 402) {
+      return res.status(402).json({ error: 'AI credits exhausted. Please try again later.' });
+    }
+    res.status(500).json({ error: "We're sorry, something went wrong. Please try again in a moment." });
+  }
+});
+
 // ----- Background job: deadline reminders -----
 async function checkTaskDeadlines() {
   const now = new Date();
