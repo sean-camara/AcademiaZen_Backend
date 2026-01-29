@@ -666,6 +666,14 @@ app.post('/api/billing/checkout', requireAuth, checkoutLimiter, async (req, res)
       return res.status(400).json({ error: 'Invalid payment method' });
     }
 
+    // NEW: Prevent duplicate purchases for ACTIVE users
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    if (isBillingActive(user.billing)) {
+      return res.status(400).json({ 
+        error: 'You already have an active subscription. Use Manage Subscription to change your plan or extend it.' 
+      });
+    }
+
     const { success, cancel } = getCheckoutUrls();
 
     const payload = {
@@ -706,7 +714,7 @@ app.post('/api/billing/checkout', requireAuth, checkoutLimiter, async (req, res)
       return res.status(502).json({ error: 'Invalid response from payment provider' });
     }
 
-    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    // Reuse the user object fetched earlier
     user.billing.plan = plan;
     user.billing.interval = interval;
     user.billing.status = 'pending';
@@ -721,6 +729,93 @@ app.post('/api/billing/checkout', requireAuth, checkoutLimiter, async (req, res)
   } catch (err) {
     console.error('Checkout creation failed:', err);
     res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// NEW: Manual subscription extension endpoint
+app.post('/api/billing/extend', requireAuth, checkoutLimiter, async (req, res) => {
+  try {
+    const { interval = 'monthly', method = 'gcash' } = req.body || {};
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+
+    // Validate: Only ACTIVE users with auto-renew OFF and near expiry can extend
+    if (!isBillingActive(user.billing)) {
+      return res.status(400).json({ error: 'You do not have an active subscription to extend.' });
+    }
+    if (user.billing.autoRenew) {
+      return res.status(400).json({ error: 'Disable auto-renew before manually extending your subscription.' });
+    }
+
+    // Check if near expiry (within 7 days)
+    const expiryDate = new Date(user.billing.currentPeriodEnd);
+    const now = new Date();
+    const daysUntilExpiry = Math.floor((expiryDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+    if (daysUntilExpiry > 7 || daysUntilExpiry < 0) {
+      return res.status(400).json({ error: 'Extension is only available within 7 days of expiry.' });
+    }
+
+    const planConfig = BILLING_PLANS['premium']?.[interval];
+    const paymentMethod = PAYMENT_METHOD_MAP[method];
+
+    if (!planConfig) {
+      return res.status(400).json({ error: 'Invalid interval' });
+    }
+    if (!paymentMethod) {
+      return res.status(400).json({ error: 'Invalid payment method' });
+    }
+
+    const { success, cancel } = getCheckoutUrls();
+
+    const payload = {
+      data: {
+        attributes: {
+          line_items: [
+            {
+              name: `${planConfig.label} - Extension`,
+              amount: planConfig.amount,
+              currency: planConfig.currency,
+              quantity: 1,
+              description: `Extend your subscription by 1 month`,
+            },
+          ],
+          payment_method_types: [paymentMethod],
+          success_url: success,
+          cancel_url: cancel,
+          description: `Extension: ${planConfig.description}`,
+          send_email_receipt: true,
+          show_description: true,
+          show_line_items: true,
+          metadata: {
+            uid: req.user.uid,
+            email: req.user.email || '',
+            plan: 'premium',
+            interval,
+            method: paymentMethod,
+            isExtension: 'true',
+          },
+        },
+      },
+    };
+
+    const response = await paymongoRequest('/checkout_sessions', { method: 'POST', body: payload });
+    const checkoutUrl = response?.data?.attributes?.checkout_url;
+    const checkoutId = response?.data?.id;
+
+    if (!checkoutUrl || !checkoutId) {
+      return res.status(502).json({ error: 'Invalid response from payment provider' });
+    }
+
+    // Mark as pending extension
+    user.billing.pendingCheckoutId = checkoutId;
+    user.billing.pendingInterval = interval;
+    user.billing.paymongo.checkoutId = checkoutId;
+    user.billing.paymongo.lastEventType = 'checkout.created';
+    await user.save();
+
+    res.json({ checkoutUrl, checkoutId });
+  } catch (err) {
+    console.error('Extension creation failed:', err);
+    res.status(500).json({ error: 'Failed to create extension checkout' });
   }
 });
 
