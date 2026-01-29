@@ -1407,12 +1407,15 @@ app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) =
 
     const prompt = buildReviewerPrompt(pdfText, config);
     
-    console.log('[AI Reviewer] Starting generation with model:', AI_MODEL_DEEP);
+    // Use the chat model (not reasoning model) for quiz generation
+    const reviewerModel = AI_MODEL_FAST; // deepseek-chat works better for structured JSON output
+    
+    console.log('[AI Reviewer] Starting generation with model:', reviewerModel);
     console.log('[AI Reviewer] PDF text length:', pdfText.length);
     console.log('[AI Reviewer] Config:', JSON.stringify(config));
     
     const payload = {
-      model: AI_MODEL_DEEP,
+      model: reviewerModel,
       max_tokens: AI_REVIEWER_MAX_TOKENS,
       temperature: 0.3,
       messages: [
