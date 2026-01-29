@@ -1407,6 +1407,10 @@ app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) =
 
     const prompt = buildReviewerPrompt(pdfText, config);
     
+    console.log('[AI Reviewer] Starting generation with model:', AI_MODEL_DEEP);
+    console.log('[AI Reviewer] PDF text length:', pdfText.length);
+    console.log('[AI Reviewer] Config:', JSON.stringify(config));
+    
     const payload = {
       model: AI_MODEL_DEEP,
       max_tokens: AI_REVIEWER_MAX_TOKENS,
@@ -1416,8 +1420,18 @@ app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) =
       ],
     };
 
-    const data = await openrouterRequest('/chat/completions', { method: 'POST', body: payload });
+    let data;
+    try {
+      data = await openrouterRequest('/chat/completions', { method: 'POST', body: payload });
+      console.log('[AI Reviewer] API response received, choices:', data?.choices?.length);
+    } catch (apiErr) {
+      console.error('[AI Reviewer] API call failed:', apiErr.message);
+      console.error('[AI Reviewer] API error payload:', JSON.stringify(apiErr.payload || {}));
+      return res.status(500).json({ error: "AI service temporarily unavailable. Please try again in a moment." });
+    }
+    
     const responseText = data?.choices?.[0]?.message?.content || '';
+    console.log('[AI Reviewer] Response text length:', responseText.length);
     
     // Parse the JSON response
     let parsed;
