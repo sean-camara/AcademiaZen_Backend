@@ -534,8 +534,31 @@ function isCheckoutPaid(checkout) {
 }
 
 // ----- Routes -----
+
+// Health check (public - for uptime monitoring, Docker, load balancers)
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Auth ping (public - for frontend to verify API is reachable)
+app.get('/api/auth/ping', (req, res) => {
+  res.json({ ok: true, timestamp: new Date().toISOString() });
+});
+
+// Current user info (protected - canonical "am I logged in?" endpoint)
+app.get('/api/me', requireAuth, async (req, res) => {
+  try {
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    res.json({
+      uid: user.uid,
+      email: user.email,
+      billing: user.billing || {},
+      createdAt: user.createdAt,
+    });
+  } catch (err) {
+    console.error('[/api/me] Error:', err);
+    res.status(500).json({ error: 'Failed to fetch user info' });
+  }
 });
 
 app.get('/api/vapid-public-key', (req, res) => {
@@ -1552,6 +1575,23 @@ async function checkTaskDeadlines() {
 const TWO_HOURS = 2 * 60 * 60 * 1000;
 setInterval(checkTaskDeadlines, TWO_HOURS);
 setTimeout(checkTaskDeadlines, 30000);
+
+// ----- 404 Handler (must be last) -----
+app.use('/api/*', (req, res) => {
+  res.status(404).json({ 
+    error: 'Not Found', 
+    message: `Endpoint ${req.method} ${req.originalUrl} does not exist`,
+    availableEndpoints: [
+      'GET /api/auth/ping',
+      'GET /api/me',
+      'GET /api/state',
+      'PUT /api/state',
+      'GET /api/billing/status',
+      'POST /api/ai/chat',
+      'POST /api/ai/generate-reviewer',
+    ]
+  });
+});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
