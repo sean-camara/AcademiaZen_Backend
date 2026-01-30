@@ -1367,12 +1367,34 @@ const MAX_AI_REVIEWERS_FREE = 3; // Free users can only have 3 reviewers
 const AI_REVIEWER_MAX_TOKENS = 8192; // DeepSeek API max limit
 const AI_REVIEWER_FREE_MAX_TOKENS = 4000; // Lower tokens for free tier (OpenRouter)
 
+// Generation rate limiting (prevents delete + recreate abuse)
+const REVIEWER_GENERATION_WINDOW_HOURS = 5; // 5 hour cooldown window
+const MAX_GENERATIONS_FREE = 3; // Free: max 3 generations per 5 hours
+const MAX_GENERATIONS_PREMIUM = 10; // Premium: max 10 generations per 5 hours
+
 // Free tier limitations
 const FREE_TIER_LIMITS = {
   maxQuestions: 10,
   allowedDifficulties: ['easy'],
   allowedModes: ['multiple_choice', 'true_false'],
 };
+
+// Helper: Get generations within the time window
+function getRecentGenerations(generations, windowHours) {
+  const cutoff = new Date(Date.now() - windowHours * 60 * 60 * 1000);
+  return (generations || []).filter(date => new Date(date) > cutoff);
+}
+
+// Helper: Get time until next available generation
+function getTimeUntilNextGeneration(generations, windowHours, maxGenerations) {
+  const recent = getRecentGenerations(generations, windowHours);
+  if (recent.length < maxGenerations) return 0;
+  
+  // Sort oldest first, find when the oldest will expire
+  const sorted = recent.sort((a, b) => new Date(a) - new Date(b));
+  const oldestExpiry = new Date(sorted[0]).getTime() + (windowHours * 60 * 60 * 1000);
+  return Math.max(0, oldestExpiry - Date.now());
+}
 
 function buildReviewerPrompt(pdfText, config) {
   const { questionCount, difficulty, questionMode } = config;
@@ -1507,6 +1529,35 @@ Respond with ONLY valid JSON in this format:
 }`;
 }
 
+// Get reviewer generation status (remaining generations, reset time)
+app.get('/api/ai/reviewer-status', requireAuth, async (req, res) => {
+  try {
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    
+    const generations = user.billing?.reviewerGenerations || [];
+    const maxGenerations = hasPremium ? MAX_GENERATIONS_PREMIUM : MAX_GENERATIONS_FREE;
+    const recentGenerations = getRecentGenerations(generations, REVIEWER_GENERATION_WINDOW_HOURS);
+    const remainingGenerations = Math.max(0, maxGenerations - recentGenerations.length);
+    
+    let resetIn = 0;
+    if (remainingGenerations === 0) {
+      resetIn = getTimeUntilNextGeneration(generations, REVIEWER_GENERATION_WINDOW_HOURS, maxGenerations);
+    }
+    
+    res.json({
+      remainingGenerations,
+      maxGenerations,
+      windowHours: REVIEWER_GENERATION_WINDOW_HOURS,
+      resetIn,
+      isPremium: hasPremium
+    });
+  } catch (err) {
+    console.error('Error fetching reviewer status:', err);
+    res.status(500).json({ error: 'Failed to fetch status' });
+  }
+});
+
 app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, async (req, res) => {
   try {
     const { pdfText, config, reviewerId } = req.body;
@@ -1527,14 +1578,38 @@ app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, async (req, 
     const user = await getOrCreateUser(req.user.uid, req.user.email);
     const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
     
-    // Check reviewer limit based on plan
+    // Check generation rate limit (prevents delete + recreate abuse)
+    const generations = user.billing?.reviewerGenerations || [];
+    const maxGenerations = hasPremium ? MAX_GENERATIONS_PREMIUM : MAX_GENERATIONS_FREE;
+    const recentGenerations = getRecentGenerations(generations, REVIEWER_GENERATION_WINDOW_HOURS);
+    
+    if (recentGenerations.length >= maxGenerations) {
+      const waitTime = getTimeUntilNextGeneration(generations, REVIEWER_GENERATION_WINDOW_HOURS, maxGenerations);
+      const hoursLeft = Math.ceil(waitTime / (1000 * 60 * 60));
+      const minsLeft = Math.ceil((waitTime % (1000 * 60 * 60)) / (1000 * 60));
+      
+      const timeStr = hoursLeft > 0 
+        ? `${hoursLeft}h ${minsLeft}m` 
+        : `${minsLeft} minutes`;
+      
+      return res.status(429).json({ 
+        error: hasPremium 
+          ? `You've reached the limit of ${maxGenerations} reviewer generations per ${REVIEWER_GENERATION_WINDOW_HOURS} hours. Please wait ${timeStr} to generate more.`
+          : `Free users can generate ${MAX_GENERATIONS_FREE} reviewers per ${REVIEWER_GENERATION_WINDOW_HOURS} hours. Wait ${timeStr} or upgrade to Premium for more!`,
+        remainingGenerations: 0,
+        resetIn: waitTime,
+        maxGenerations
+      });
+    }
+    
+    // Check reviewer storage limit based on plan
     const existingReviewers = user.state?.aiReviewers || [];
     const maxReviewers = hasPremium ? MAX_AI_REVIEWERS : MAX_AI_REVIEWERS_FREE;
     if (existingReviewers.length >= maxReviewers) {
       return res.status(400).json({ 
         error: hasPremium 
-          ? `You've reached the maximum of ${MAX_AI_REVIEWERS} reviewers. Please delete some to create new ones.`
-          : `Free users can only have ${MAX_AI_REVIEWERS_FREE} reviewers. Upgrade to Premium for unlimited reviewers!`
+          ? `You've reached the maximum of ${MAX_AI_REVIEWERS} stored reviewers. Please delete some to create new ones.`
+          : `Free users can only store ${MAX_AI_REVIEWERS_FREE} reviewers. Upgrade to Premium for up to ${MAX_AI_REVIEWERS}!`
       });
     }
 
@@ -1687,9 +1762,21 @@ app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, async (req, 
     // Randomize question order so they don't follow PDF content order
     questions = shuffleArray(questions);
 
+    // Record this generation to prevent abuse (delete + recreate)
+    const updatedGenerations = [...recentGenerations, new Date()];
+    await User.findOneAndUpdate(
+      { uid: req.user.uid },
+      { $set: { 'billing.reviewerGenerations': updatedGenerations } }
+    );
+
+    // Calculate remaining generations for this window
+    const remainingGenerations = maxGenerations - updatedGenerations.length;
+
     res.json({
       suggestedName: parsed.suggestedName || 'AI Reviewer',
-      questions
+      questions,
+      remainingGenerations,
+      maxGenerations
     });
 
   } catch (err) {

@@ -128,6 +128,8 @@ const BillingSchema = new mongoose.Schema({
   pendingCheckoutId: { type: String, default: '' },
   pendingPlan: { type: String, default: '' },
   pendingInterval: { type: String, default: '' },
+  // Track reviewer generations to prevent abuse (delete + recreate)
+  reviewerGenerations: { type: [Date], default: [] },
   paymongo: {
     checkoutId: { type: String, default: '' },
     paymentId: { type: String, default: '' },
