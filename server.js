@@ -1363,7 +1363,16 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
 
 // ----- AI Reviewer Generation -----
 const MAX_AI_REVIEWERS = 10;
+const MAX_AI_REVIEWERS_FREE = 3; // Free users can only have 3 reviewers
 const AI_REVIEWER_MAX_TOKENS = 8192; // DeepSeek API max limit
+const AI_REVIEWER_FREE_MAX_TOKENS = 4000; // Lower tokens for free tier (OpenRouter)
+
+// Free tier limitations
+const FREE_TIER_LIMITS = {
+  maxQuestions: 10,
+  allowedDifficulties: ['easy'],
+  allowedModes: ['multiple_choice', 'true_false'],
+};
 
 function buildReviewerPrompt(pdfText, config) {
   const { questionCount, difficulty, questionMode } = config;
@@ -1517,35 +1526,78 @@ app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, async (req, 
     // Check premium status
     const user = await getOrCreateUser(req.user.uid, req.user.email);
     const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
-    if (!hasPremium) {
-      return res.status(402).json({ error: 'Premium subscription required for AI Reviewers' });
-    }
-
-    // Check reviewer limit
-    const existingReviewers = user.state?.aiReviewers || [];
-    if (existingReviewers.length >= MAX_AI_REVIEWERS) {
-      return res.status(400).json({ error: `You've reached the maximum of ${MAX_AI_REVIEWERS} reviewers. Please delete some to create new ones.` });
-    }
-
-    const prompt = buildReviewerPrompt(pdfText, config);
     
-    // Use DeepSeek Direct API (paid, separate from OpenRouter used by ZenAI chat)
-    console.log('[AI Reviewer] Starting generation with DeepSeek Direct API');
-    console.log('[AI Reviewer] Model:', DEEPSEEK_REVIEWER_MODEL);
-    console.log('[AI Reviewer] PDF text length:', pdfText.length);
-    console.log('[AI Reviewer] Config:', JSON.stringify(config));
+    // Check reviewer limit based on plan
+    const existingReviewers = user.state?.aiReviewers || [];
+    const maxReviewers = hasPremium ? MAX_AI_REVIEWERS : MAX_AI_REVIEWERS_FREE;
+    if (existingReviewers.length >= maxReviewers) {
+      return res.status(400).json({ 
+        error: hasPremium 
+          ? `You've reached the maximum of ${MAX_AI_REVIEWERS} reviewers. Please delete some to create new ones.`
+          : `Free users can only have ${MAX_AI_REVIEWERS_FREE} reviewers. Upgrade to Premium for unlimited reviewers!`
+      });
+    }
 
+    // For free users, enforce limitations
+    let finalConfig = { ...config };
+    if (!hasPremium) {
+      // Enforce free tier limits
+      if (finalConfig.questionCount > FREE_TIER_LIMITS.maxQuestions) {
+        finalConfig.questionCount = FREE_TIER_LIMITS.maxQuestions;
+      }
+      if (!FREE_TIER_LIMITS.allowedDifficulties.includes(finalConfig.difficulty)) {
+        return res.status(403).json({ error: 'Free users can only use Easy difficulty. Upgrade to Premium for Medium and Hard!' });
+      }
+      if (!FREE_TIER_LIMITS.allowedModes.includes(finalConfig.questionMode)) {
+        return res.status(403).json({ error: 'Free users can only use Multiple Choice and True/False. Upgrade to Premium for more question types!' });
+      }
+    }
+
+    const prompt = buildReviewerPrompt(pdfText, finalConfig);
+    
     let data;
-    try {
-      data = await deepseekReviewerRequest(
-        [{ role: 'user', content: prompt }],
-        AI_REVIEWER_MAX_TOKENS
-      );
-      console.log('[AI Reviewer] API response received, choices:', data?.choices?.length);
-    } catch (apiErr) {
-      console.error('[AI Reviewer] DeepSeek API call failed:', apiErr.message);
-      console.error('[AI Reviewer] API error payload:', JSON.stringify(apiErr.payload || {}));
-      return res.status(500).json({ error: "AI service temporarily unavailable. Please try again in a moment." });
+    
+    if (hasPremium) {
+      // Premium users: Use paid DeepSeek Direct API
+      console.log('[AI Reviewer] Premium user - Using DeepSeek Direct API');
+      console.log('[AI Reviewer] Model:', DEEPSEEK_REVIEWER_MODEL);
+      console.log('[AI Reviewer] PDF text length:', pdfText.length);
+      console.log('[AI Reviewer] Config:', JSON.stringify(finalConfig));
+
+      try {
+        data = await deepseekReviewerRequest(
+          [{ role: 'user', content: prompt }],
+          AI_REVIEWER_MAX_TOKENS
+        );
+        console.log('[AI Reviewer] API response received, choices:', data?.choices?.length);
+      } catch (apiErr) {
+        console.error('[AI Reviewer] DeepSeek API call failed:', apiErr.message);
+        console.error('[AI Reviewer] API error payload:', JSON.stringify(apiErr.payload || {}));
+        return res.status(500).json({ error: "AI service temporarily unavailable. Please try again in a moment." });
+      }
+    } else {
+      // Free users: Use OpenRouter free tier
+      console.log('[AI Reviewer] Free user - Using OpenRouter Free API');
+      console.log('[AI Reviewer] Model:', AI_MODEL_FAST);
+      console.log('[AI Reviewer] PDF text length:', pdfText.length);
+      console.log('[AI Reviewer] Config:', JSON.stringify(finalConfig));
+
+      try {
+        data = await openrouterRequest('/chat/completions', {
+          method: 'POST',
+          body: {
+            model: AI_MODEL_FAST,
+            max_tokens: AI_REVIEWER_FREE_MAX_TOKENS,
+            temperature: 0.3,
+            messages: [{ role: 'user', content: prompt }],
+          }
+        });
+        console.log('[AI Reviewer] OpenRouter response received, choices:', data?.choices?.length);
+      } catch (apiErr) {
+        console.error('[AI Reviewer] OpenRouter API call failed:', apiErr.message);
+        console.error('[AI Reviewer] API error payload:', JSON.stringify(apiErr.payload || {}));
+        return res.status(500).json({ error: "AI service temporarily unavailable. Please try again in a moment." });
+      }
     }
     
     const responseText = data?.choices?.[0]?.message?.content || '';
