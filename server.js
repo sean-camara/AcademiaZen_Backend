@@ -275,6 +275,7 @@ const PAYMONGO_WEBHOOK_SECRET = resolveEnvRef(process.env.PAYMONGO_WEBHOOK_SECRE
 const BILLING_COUPON_SECRET = resolveEnvRef(process.env.BILLING_COUPON_SECRET);
 const BILLING_COUPON_INTERVAL = (process.env.BILLING_COUPON_INTERVAL || 'monthly').toLowerCase();
 const BILLING_COUPON_METHOD = (process.env.BILLING_COUPON_METHOD || 'qrph').toLowerCase();
+const BILLING_COUPON_DIRECT_GRANT = process.env.BILLING_COUPON_DIRECT_GRANT === 'true';
 
 const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
 const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
@@ -904,6 +905,15 @@ app.post('/api/billing/secret-checkout', requireAuth, checkoutLimiter, async (re
       return res.status(400).json({ error: 'Invalid coupon configuration' });
     }
 
+    if (BILLING_COUPON_DIRECT_GRANT) {
+      applyPaidSubscription(user, interval, {
+        eventType: 'coupon.grant',
+        eventId: `coupon-${Date.now()}`,
+      });
+      await user.save();
+      return res.json({ direct: true, billing: getBillingSnapshot(user.billing) });
+    }
+
     const { success, cancel } = getCheckoutUrls();
     const payload = {
       data: {
@@ -911,7 +921,7 @@ app.post('/api/billing/secret-checkout', requireAuth, checkoutLimiter, async (re
           line_items: [
             {
               name: `${planConfig.label} (Secret Coupon)`,
-              amount: 0,
+              amount: 100,
               currency: planConfig.currency,
               quantity: 1,
               description: 'Secret coupon checkout',
