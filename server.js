@@ -332,26 +332,24 @@ function isOwnedKey(key, uid) {
 
 const BILLING_PLANS = {
   premium: {
+    weekly: {
+      amount: 4900,
+      currency: 'PHP',
+      label: 'Premium Weekly',
+      description: 'AcademiaZen Premium (Weekly)',
+      interval: 'weekly',
+    },
     monthly: {
-      amount: 14900,
+      amount: 12900,
       currency: 'PHP',
       label: 'Premium Monthly',
       description: 'AcademiaZen Premium (Monthly)',
       interval: 'monthly',
     },
-    yearly: {
-      amount: 149000,
-      currency: 'PHP',
-      label: 'Premium Yearly',
-      description: 'AcademiaZen Premium (Yearly)',
-      interval: 'yearly',
-    },
   },
 };
 
 const PAYMENT_METHOD_MAP = {
-  gcash: 'gcash',
-  bank: 'qrph',
   qrph: 'qrph',
 };
 
@@ -371,7 +369,9 @@ function getCheckoutUrls() {
 
 function addInterval(date, interval) {
   const next = new Date(date);
-  if (interval === 'yearly') {
+  if (interval === 'weekly') {
+    next.setDate(next.getDate() + 7);
+  } else if (interval === 'yearly') {
     next.setFullYear(next.getFullYear() + 1);
   } else {
     next.setMonth(next.getMonth() + 1);
@@ -749,7 +749,7 @@ app.post('/api/billing/cancel', requireAuth, async (req, res) => {
 
 app.post('/api/billing/checkout', requireAuth, checkoutLimiter, async (req, res) => {
   try {
-    const { plan = 'premium', interval = 'monthly', method = 'gcash' } = req.body || {};
+    const { plan = 'premium', interval = 'monthly', method = 'qrph' } = req.body || {};
     const planConfig = BILLING_PLANS[plan]?.[interval];
     const paymentMethod = PAYMENT_METHOD_MAP[method];
 
@@ -829,7 +829,7 @@ app.post('/api/billing/checkout', requireAuth, checkoutLimiter, async (req, res)
 // NEW: Manual subscription extension endpoint
 app.post('/api/billing/extend', requireAuth, checkoutLimiter, async (req, res) => {
   try {
-    const { interval = 'monthly', method = 'gcash' } = req.body || {};
+    const { interval = 'monthly', method = 'qrph' } = req.body || {};
     const user = await getOrCreateUser(req.user.uid, req.user.email);
 
     // Validate: Only ACTIVE users with auto-renew OFF and near expiry can extend
@@ -860,6 +860,8 @@ app.post('/api/billing/extend', requireAuth, checkoutLimiter, async (req, res) =
 
     const { success, cancel } = getCheckoutUrls();
 
+    const intervalLabel = interval === 'weekly' ? '1 week' : '1 month';
+
     const payload = {
       data: {
         attributes: {
@@ -869,7 +871,7 @@ app.post('/api/billing/extend', requireAuth, checkoutLimiter, async (req, res) =
               amount: planConfig.amount,
               currency: planConfig.currency,
               quantity: 1,
-              description: `Extend your subscription by 1 month`,
+              description: `Extend your subscription by ${intervalLabel}`,
             },
           ],
           payment_method_types: [paymentMethod],
