@@ -158,6 +158,7 @@ function isValidState(state) {
   if (!Array.isArray(state.subjects)) return false;
   if (!Array.isArray(state.flashcards)) return false;
   if (!Array.isArray(state.folders)) return false;
+  if (state.aiChat && !Array.isArray(state.aiChat)) return false;
   if (!state.profile || !state.settings) return false;
   return true;
 }
@@ -165,6 +166,8 @@ function isValidState(state) {
 const MAX_STATE_BYTES = Number(process.env.MAX_STATE_BYTES || 5 * 1024 * 1024);
 const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 1 * 1024 * 1024);
 const MAX_ATTACHMENT_BASE64_LEN = Math.ceil(MAX_ATTACHMENT_BYTES * 1.37);
+const MAX_AI_CHAT_MESSAGES = Number(process.env.MAX_AI_CHAT_MESSAGES || 60);
+const MAX_AI_CHAT_CHARS = Number(process.env.MAX_AI_CHAT_CHARS || 8000);
 
 function sanitizeStateForStorage(state) {
   const sanitized = JSON.parse(JSON.stringify(state));
@@ -203,6 +206,23 @@ function sanitizeStateForStorage(state) {
       }
       return folder;
     });
+  }
+
+  if (Array.isArray(sanitized.aiChat)) {
+    const trimmed = sanitized.aiChat.slice(-MAX_AI_CHAT_MESSAGES).map(message => {
+      if (!message || typeof message !== 'object') return null;
+      const text = typeof message.text === 'string' ? message.text : '';
+      const role = message.role === 'ai' ? 'ai' : 'user';
+      const refs = Array.isArray(message.refs) ? message.refs.filter(r => typeof r === 'string').slice(0, 20) : [];
+      const createdAt = typeof message.createdAt === 'string' ? message.createdAt : '';
+      return {
+        role,
+        text: text.length > MAX_AI_CHAT_CHARS ? text.slice(0, MAX_AI_CHAT_CHARS) : text,
+        refs,
+        createdAt,
+      };
+    }).filter(Boolean);
+    sanitized.aiChat = trimmed;
   }
 
   const sizeBytes = Buffer.byteLength(JSON.stringify(sanitized), 'utf8');
@@ -1876,7 +1896,7 @@ app.use('/api/*', (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`AcademiaZen API listening on port ${PORT}`);
 });

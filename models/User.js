@@ -100,6 +100,13 @@ const QuizProgressSchema = new mongoose.Schema({
   timeRemaining: { type: Number, default: null },
 }, { _id: false });
 
+const AIChatMessageSchema = new mongoose.Schema({
+  role: { type: String, enum: ['user', 'ai'], default: 'user' },
+  text: { type: String, default: '' },
+  refs: { type: [String], default: [] },
+  createdAt: { type: String, default: '' },
+}, { _id: false });
+
 const UserProfileSchema = new mongoose.Schema({
   name: { type: String, default: 'Student' },
   university: { type: String, default: '' },
@@ -147,6 +154,7 @@ const ZenStateSchema = new mongoose.Schema({
   folders: { type: [FolderSchema], default: [] },
   aiReviewers: { type: [AIReviewerSchema], default: [] },
   quizProgress: { type: QuizProgressSchema, default: null },
+  aiChat: { type: [AIChatMessageSchema], default: [] },
   profile: { type: UserProfileSchema, default: () => ({}) },
   settings: { type: AppSettingsSchema, default: () => ({}) },
 }, { _id: false });
@@ -168,6 +176,7 @@ function getDefaultState() {
     ],
     aiReviewers: [],
     quizProgress: null,
+    aiChat: [],
     profile: {
       name: 'Student',
       university: '',
