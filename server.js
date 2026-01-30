@@ -171,6 +171,9 @@ const MAX_AI_CHAT_CHARS = Number(process.env.MAX_AI_CHAT_CHARS || 8000);
 
 function sanitizeStateForStorage(state) {
   const sanitized = JSON.parse(JSON.stringify(state));
+  if (typeof sanitized.updatedAt !== 'string' || !sanitized.updatedAt) {
+    sanitized.updatedAt = new Date().toISOString();
+  }
 
   if (Array.isArray(sanitized.tasks)) {
     sanitized.tasks = sanitized.tasks.map(task => {
@@ -555,7 +558,9 @@ async function deepseekReviewerRequest(messages, maxTokens = 8000) {
 }
 
 function verifyPaymongoSignature(req) {
-  if (!PAYMONGO_WEBHOOK_SECRET) return true;
+  if (!PAYMONGO_WEBHOOK_SECRET) {
+    return process.env.NODE_ENV !== 'production';
+  }
   const header = req.headers['paymongo-signature'];
   if (!header || !req.rawBody) return false;
 
@@ -1138,7 +1143,12 @@ app.put('/api/state', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid state payload' });
     }
     const user = await getOrCreateUser(req.user.uid, req.user.email);
-    user.state = sanitizeStateForStorage(state);
+    const sanitizedState = sanitizeStateForStorage(state);
+    const stateBytes = Buffer.byteLength(JSON.stringify(sanitizedState), 'utf8');
+    if (stateBytes > MAX_STATE_BYTES) {
+      return res.status(413).json({ error: 'State payload too large' });
+    }
+    user.state = sanitizedState;
     user.email = req.user.email || user.email;
     await user.save();
     res.json({ success: true });
@@ -1875,9 +1885,109 @@ async function checkTaskDeadlines() {
   }
 }
 
+function isSameLocalDay(a, b) {
+  return a.getFullYear() === b.getFullYear()
+    && a.getMonth() === b.getMonth()
+    && a.getDate() === b.getDate();
+}
+
+function isWithinWindow(now, hour, minute, windowMinutes = 15) {
+  const minutesNow = now.getHours() * 60 + now.getMinutes();
+  const target = hour * 60 + minute;
+  return minutesNow >= target && minutesNow < target + windowMinutes;
+}
+
+async function checkDailyBriefings() {
+  const now = new Date();
+  if (!isWithinWindow(now, 8, 0, 20)) return;
+
+  try {
+    const users = await User.find({
+      'state.settings.notifications': true,
+      'state.settings.dailyBriefing': true,
+    });
+
+    for (const user of users) {
+      const lastSent = user.notificationMeta?.lastDailyBriefingAt;
+      if (lastSent && isSameLocalDay(new Date(lastSent), now)) continue;
+
+      const tasks = (user.state?.tasks || []).filter(t => t && !t.completed && t.dueDate);
+      const dueToday = tasks.filter(t => {
+        const due = new Date(t.dueDate);
+        return !Number.isNaN(due.getTime()) && isSameLocalDay(due, now);
+      });
+
+      const payload = JSON.stringify({
+        title: '☀️ Morning Brief',
+        body: dueToday.length > 0
+          ? `You have ${dueToday.length} task${dueToday.length === 1 ? '' : 's'} due today.`
+          : 'No tasks due today. Keep the momentum going!',
+        icon: '/icons/icon-192x192.svg',
+        badge: '/icons/icon-72x72.svg',
+        url: '/?page=home',
+        tag: `daily-brief-${user.uid}-${now.toISOString().slice(0, 10)}`,
+      });
+
+      const results = await sendNotificationToUser(user.uid, payload);
+      const sent = results.some(r => r.status === 'fulfilled' && r.value?.success);
+      if (sent) {
+        if (!user.notificationMeta) user.notificationMeta = {};
+        user.notificationMeta.lastDailyBriefingAt = now;
+        await user.save();
+      }
+    }
+  } catch (err) {
+    console.error('Daily briefing job failed:', err);
+  }
+}
+
+async function checkStudyReminders() {
+  const now = new Date();
+  if (!isWithinWindow(now, 18, 0, 20)) return;
+
+  try {
+    const users = await User.find({
+      'state.settings.notifications': true,
+      'state.settings.studyReminders': true,
+    });
+
+    for (const user of users) {
+      const lastSent = user.notificationMeta?.lastStudyReminderAt;
+      if (lastSent && isSameLocalDay(new Date(lastSent), now)) continue;
+
+      const pending = (user.state?.tasks || []).filter(t => t && !t.completed).length;
+      const payload = JSON.stringify({
+        title: '📚 Study Nudge',
+        body: pending > 0
+          ? `You have ${pending} task${pending === 1 ? '' : 's'} waiting.`
+          : 'No pending tasks. Great job staying on track!',
+        icon: '/icons/icon-192x192.svg',
+        badge: '/icons/icon-72x72.svg',
+        url: '/?page=review',
+        tag: `study-nudge-${user.uid}-${now.toISOString().slice(0, 10)}`,
+      });
+
+      const results = await sendNotificationToUser(user.uid, payload);
+      const sent = results.some(r => r.status === 'fulfilled' && r.value?.success);
+      if (sent) {
+        if (!user.notificationMeta) user.notificationMeta = {};
+        user.notificationMeta.lastStudyReminderAt = now;
+        await user.save();
+      }
+    }
+  } catch (err) {
+    console.error('Study reminder job failed:', err);
+  }
+}
+
 const TWO_HOURS = 2 * 60 * 60 * 1000;
+const TEN_MINUTES = 10 * 60 * 1000;
 setInterval(checkTaskDeadlines, TWO_HOURS);
+setInterval(checkDailyBriefings, TEN_MINUTES);
+setInterval(checkStudyReminders, TEN_MINUTES);
 setTimeout(checkTaskDeadlines, 30000);
+setTimeout(checkDailyBriefings, 30000);
+setTimeout(checkStudyReminders, 30000);
 
 // ----- 404 Handler (must be last) -----
 app.use('/api/*', (req, res) => {
@@ -1896,7 +2006,7 @@ app.use('/api/*', (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`AcademiaZen API listening on port ${PORT}`);
 });

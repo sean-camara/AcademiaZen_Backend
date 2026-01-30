@@ -124,6 +124,11 @@ const AppSettingsSchema = new mongoose.Schema({
   studyReminders: { type: Boolean, default: true },
 }, { _id: false });
 
+const NotificationMetaSchema = new mongoose.Schema({
+  lastDailyBriefingAt: { type: Date, default: null },
+  lastStudyReminderAt: { type: Date, default: null },
+}, { _id: false });
+
 const BillingSchema = new mongoose.Schema({
   plan: { type: String, enum: ['free', 'premium'], default: 'free' },
   interval: { type: String, enum: ['none', 'monthly', 'yearly'], default: 'none' },
@@ -157,12 +162,14 @@ const ZenStateSchema = new mongoose.Schema({
   aiChat: { type: [AIChatMessageSchema], default: [] },
   profile: { type: UserProfileSchema, default: () => ({}) },
   settings: { type: AppSettingsSchema, default: () => ({}) },
+  updatedAt: { type: String, default: '' },
 }, { _id: false });
 
 const UserSchema = new mongoose.Schema({
   uid: { type: String, required: true, unique: true, index: true },
   email: { type: String, default: '' },
   state: { type: ZenStateSchema, default: () => getDefaultState() },
+  notificationMeta: { type: NotificationMetaSchema, default: () => ({}) },
   billing: { type: BillingSchema, default: () => ({}) },
 }, { timestamps: true });
 
@@ -192,6 +199,7 @@ function getDefaultState() {
       dailyBriefing: true,
       studyReminders: true,
     },
+    updatedAt: new Date().toISOString(),
   };
 }
 
