@@ -1536,11 +1536,41 @@ app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) =
       return res.status(500).json({ error: "We're sorry, the AI couldn't generate proper questions. Please try again." });
     }
 
-    // Add IDs to questions
-    const questions = parsed.questions.map((q, idx) => ({
-      id: `q_${Date.now()}_${idx}`,
-      ...q
-    }));
+    // Shuffle array helper
+    const shuffleArray = (array) => {
+      const shuffled = [...array];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      return shuffled;
+    };
+
+    // Process and randomize questions
+    let questions = parsed.questions.map((q, idx) => {
+      const question = {
+        id: `q_${Date.now()}_${idx}`,
+        ...q
+      };
+
+      // For word matching, shuffle the definitions (right side) to make it unpredictable
+      if (question.type === 'word_matching' && question.pairs && Array.isArray(question.pairs)) {
+        const leftTerms = question.pairs.map(p => p.left);
+        const rightDefs = shuffleArray(question.pairs.map(p => p.right));
+        
+        // Create new pairs with shuffled definitions
+        question.pairs = leftTerms.map((left, i) => ({
+          id: `pair_${idx}_${i}`,
+          left: left,
+          right: rightDefs[i]
+        }));
+      }
+
+      return question;
+    });
+
+    // Randomize question order so they don't follow PDF content order
+    questions = shuffleArray(questions);
 
     res.json({
       suggestedName: parsed.suggestedName || 'AI Reviewer',
