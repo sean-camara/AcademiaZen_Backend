@@ -1324,38 +1324,86 @@ function buildReviewerPrompt(pdfText, config) {
   
   let questionTypeInstructions = '';
   if (questionMode === 'identification') {
-    questionTypeInstructions = `Generate ONLY identification questions where the user must type the answer.`;
+    questionTypeInstructions = `Generate ONLY identification questions where the user must type the answer. Focus on key terms, definitions, names, dates, and important concepts.`;
   } else if (questionMode === 'multiple_choice') {
-    questionTypeInstructions = `Generate ONLY multiple choice questions with 4 options (A, B, C, D).`;
+    questionTypeInstructions = `Generate ONLY multiple choice questions with 4 options (A, B, C, D). Make distractors (wrong answers) plausible but clearly incorrect. Avoid "all of the above" or "none of the above" options.`;
   } else if (questionMode === 'true_false') {
-    questionTypeInstructions = `Generate ONLY true/false questions.`;
+    questionTypeInstructions = `Generate ONLY true/false questions. Make statements specific and based on explicit facts from the content. Avoid ambiguous or trick questions.`;
   } else if (questionMode === 'word_matching') {
-    questionTypeInstructions = `Generate ONLY word matching questions with 4-5 pairs each where users match terms to their definitions/meanings.`;
+    questionTypeInstructions = `Generate ONLY word matching questions with exactly 4-5 pairs. Match terms to their precise definitions, not general descriptions. Each pair must have a clear one-to-one relationship.`;
   } else {
     // hybrid - random distribution
-    questionTypeInstructions = `Generate a MIX of question types: identification (type answer), multiple choice (A/B/C/D), true/false, and word matching (match terms to definitions). Randomly distribute the types.`;
+    questionTypeInstructions = `Generate a balanced MIX of question types:
+    - 40% Multiple Choice (with plausible distractors)
+    - 30% Identification (key terms and concepts)
+    - 20% True/False (specific factual statements)
+    - 10% Word Matching (term-definition pairs)
+    
+    Distribute these types evenly throughout the quiz.`;
   }
 
   const difficultyInstructions = {
-    easy: 'Questions should be straightforward and test basic recall and understanding.',
-    medium: 'Questions should require moderate understanding and some application of concepts.',
-    hard: 'Questions should be challenging, requiring deep understanding, analysis, and critical thinking.'
+    easy: `EASY Difficulty Guidelines:
+    - Test basic recall of facts, terms, and definitions explicitly stated in the content
+    - Use straightforward language and avoid complex phrasing
+    - Focus on "who, what, when, where" questions
+    - For multiple choice, make incorrect options obviously wrong
+    - Answers should be directly found in the text without inference
+    - Example: "What is the definition of X?" "Who discovered Y?"`,
+    
+    medium: `MEDIUM Difficulty Guidelines:
+    - Test understanding and application of concepts, not just memorization
+    - Require students to make connections between related ideas
+    - Include questions that need interpretation of diagrams, examples, or scenarios
+    - For multiple choice, use plausible distractors that test common misconceptions
+    - Answers may require combining information from multiple parts of the content
+    - Example: "How does X relate to Y?" "What would happen if Z occurred?"`,
+    
+    hard: `HARD Difficulty Guidelines:
+    - Test deep analysis, synthesis, and evaluation of complex concepts
+    - Require critical thinking and application to novel situations not explicitly covered
+    - Include questions about implications, comparisons, and theoretical applications
+    - For multiple choice, use sophisticated distractors that require expert-level discernment
+    - May require multi-step reasoning or integration of multiple concepts
+    - Example: "Analyze the implications of X on Y" "Compare and contrast A, B, and C" "Evaluate the effectiveness of Z"`
   };
 
-  return `You are an expert quiz generator for educational content. Based on the following PDF content, generate exactly ${questionCount} quiz questions.
+  const qualityStandards = `
+QUALITY STANDARDS (CRITICAL):
+✓ Each question MUST test exactly ONE concept clearly
+✓ Avoid vague wording like "usually," "sometimes," "may be"
+✓ Questions should be complete sentences ending with question marks
+✓ For multiple choice: Wrong answers must be in the same category as correct answer
+✓ For identification: Accept reasonable variations in spelling/phrasing
+✓ For true/false: Make statements absolute and verifiable from the content
+✓ For word matching: Terms and definitions must be from the SAME content domain
+✓ Avoid questions that depend on previous questions
+✓ Do NOT create questions about page numbers, author names, or document metadata
+✓ Focus on SUBSTANTIVE CONTENT, not formatting or structure`;
+
+  return `You are an expert educational assessment designer creating a high-quality academic quiz. Your questions will be used by students to test their understanding of course material.
+
+📚 CONTENT TO ASSESS:
+${pdfText.slice(0, 12000)}
+
+🎯 QUIZ SPECIFICATIONS:
+- Number of Questions: ${questionCount}
+- Difficulty Level: ${difficulty.toUpperCase()}
+- Question Type: ${questionMode === 'hybrid' ? 'Mixed (balanced distribution)' : questionMode.replace('_', ' ')}
 
 ${questionTypeInstructions}
 
-Difficulty Level: ${difficulty.toUpperCase()}
 ${difficultyInstructions[difficulty]}
 
+${qualityStandards}
+
 IMPORTANT RULES:
-1. Questions must be based ONLY on the provided content
-2. Each question must have a clear, unambiguous correct answer
-3. For identification questions, the answer should be a single word or short phrase
-4. For multiple choice, always provide exactly 4 options labeled A, B, C, D
-5. For true/false, the statement must be clearly true or false based on the content
-6. For word matching, provide 4-5 pairs of terms and their matching definitions
+1. Questions must be based ONLY on the provided content - do NOT add external information
+2. Each question must have ONE clear, unambiguous correct answer verifiable from the content
+3. For identification questions, the answer should be a single word or short phrase (2-5 words max)
+4. For multiple choice, always provide exactly 4 options labeled A, B, C, D with clear formatting
+5. For true/false, the statement must be clearly true OR false based on explicit content - no edge cases
+6. For word matching, provide exactly 4-5 pairs of terms and their matching definitions
 
 OUTPUT FORMAT (JSON array):
 [
