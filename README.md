@@ -139,7 +139,7 @@ Express.js (REST API)
 
    # MongoDB
    MONGODB_URI=mongodb://localhost:27017/academiazen
-   # Or Atlas: mongodb+srv://user:pass@cluster.mongodb.net/academiazen
+   # Or Atlas: mongodb+srv://<username>:<password>@<cluster>.mongodb.net/<database>
 
    # Firebase Admin SDK
    FIREBASE_PROJECT_ID=your-project-id
