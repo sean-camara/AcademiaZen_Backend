@@ -272,6 +272,9 @@ function resolveEnvRef(value) {
 const PAYMONGO_SECRET_KEY = resolveEnvRef(process.env.PAYMONGO_SECRET_KEY);
 const PAYMONGO_API_BASE = process.env.PAYMONGO_API_BASE || 'https://api.paymongo.com/v1';
 const PAYMONGO_WEBHOOK_SECRET = resolveEnvRef(process.env.PAYMONGO_WEBHOOK_SECRET);
+const BILLING_COUPON_SECRET = resolveEnvRef(process.env.BILLING_COUPON_SECRET);
+const BILLING_COUPON_INTERVAL = (process.env.BILLING_COUPON_INTERVAL || 'monthly').toLowerCase();
+const BILLING_COUPON_METHOD = (process.env.BILLING_COUPON_METHOD || 'qrph').toLowerCase();
 
 const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
 const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
@@ -359,6 +362,18 @@ const BILLING_PLANS = {
 const PAYMENT_METHOD_MAP = {
   qrph: 'qrph',
 };
+
+function isCouponCodeValid(code) {
+  if (!BILLING_COUPON_SECRET) return false;
+  const input = Buffer.from(String(code || ''), 'utf8');
+  const secret = Buffer.from(String(BILLING_COUPON_SECRET || ''), 'utf8');
+  if (input.length !== secret.length) return false;
+  try {
+    return crypto.timingSafeEqual(input, secret);
+  } catch (_) {
+    return false;
+  }
+}
 
 function getCheckoutUrls() {
   const base = process.env.PAYMONGO_SUCCESS_URL
@@ -859,6 +874,89 @@ app.post('/api/billing/checkout', requireAuth, checkoutLimiter, async (req, res)
     res.json({ checkoutUrl, checkoutId });
   } catch (err) {
     console.error('Checkout creation failed:', err);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// Secret coupon checkout (zero-cost)
+app.post('/api/billing/secret-checkout', requireAuth, checkoutLimiter, async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!BILLING_COUPON_SECRET) {
+      return res.status(503).json({ error: 'Coupon is not configured' });
+    }
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ error: 'Coupon code is required' });
+    }
+    if (!isCouponCodeValid(code.trim())) {
+      return res.status(403).json({ error: 'Invalid coupon code' });
+    }
+
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    if (isBillingActive(user.billing)) {
+      return res.status(400).json({ error: 'You already have an active subscription.' });
+    }
+
+    const interval = BILLING_PLANS.premium?.[BILLING_COUPON_INTERVAL] ? BILLING_COUPON_INTERVAL : 'monthly';
+    const planConfig = BILLING_PLANS.premium?.[interval];
+    const paymentMethod = PAYMENT_METHOD_MAP[BILLING_COUPON_METHOD] || PAYMENT_METHOD_MAP.qrph;
+    if (!planConfig || !paymentMethod) {
+      return res.status(400).json({ error: 'Invalid coupon configuration' });
+    }
+
+    const { success, cancel } = getCheckoutUrls();
+    const payload = {
+      data: {
+        attributes: {
+          line_items: [
+            {
+              name: `${planConfig.label} (Secret Coupon)`,
+              amount: 0,
+              currency: planConfig.currency,
+              quantity: 1,
+              description: 'Secret coupon checkout',
+            },
+          ],
+          payment_method_types: [paymentMethod],
+          success_url: success,
+          cancel_url: cancel,
+          description: 'Secret coupon checkout',
+          send_email_receipt: true,
+          show_description: true,
+          show_line_items: true,
+          metadata: {
+            uid: req.user.uid,
+            email: req.user.email || '',
+            plan: 'premium',
+            interval,
+            method: paymentMethod,
+            coupon: 'secret',
+          },
+        },
+      },
+    };
+
+    const response = await paymongoRequest('/checkout_sessions', { method: 'POST', body: payload });
+    const checkoutUrl = response?.data?.attributes?.checkout_url;
+    const checkoutId = response?.data?.id;
+
+    if (!checkoutUrl || !checkoutId) {
+      return res.status(502).json({ error: 'Invalid response from payment provider' });
+    }
+
+    user.billing.plan = 'premium';
+    user.billing.interval = interval;
+    user.billing.status = 'pending';
+    user.billing.pendingCheckoutId = checkoutId;
+    user.billing.pendingPlan = 'premium';
+    user.billing.pendingInterval = interval;
+    user.billing.paymongo.checkoutId = checkoutId;
+    user.billing.paymongo.lastEventType = 'checkout.created';
+    await user.save();
+
+    res.json({ checkoutUrl, checkoutId });
+  } catch (err) {
+    console.error('Secret checkout failed:', err);
     res.status(500).json({ error: 'Failed to create checkout session' });
   }
 });
