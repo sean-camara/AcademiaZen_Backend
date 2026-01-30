@@ -1317,7 +1317,7 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
 
 // ----- AI Reviewer Generation -----
 const MAX_AI_REVIEWERS = 10;
-const AI_REVIEWER_MAX_TOKENS = 8000;
+const AI_REVIEWER_MAX_TOKENS = 12000; // Increased to handle 10+ questions reliably
 
 function buildReviewerPrompt(pdfText, config) {
   const { questionCount, difficulty, questionMode } = config;
@@ -1387,7 +1387,7 @@ QUALITY STANDARDS (CRITICAL):
 ${pdfText.slice(0, 12000)}
 
 🎯 QUIZ SPECIFICATIONS:
-- Number of Questions: ${questionCount}
+- Number of Questions: EXACTLY ${questionCount} questions (THIS IS MANDATORY - DO NOT GENERATE MORE OR LESS)
 - Difficulty Level: ${difficulty.toUpperCase()}
 - Question Type: ${questionMode === 'hybrid' ? 'Mixed (balanced distribution)' : questionMode.replace('_', ' ')}
 
@@ -1396,6 +1396,11 @@ ${questionTypeInstructions}
 ${difficultyInstructions[difficulty]}
 
 ${qualityStandards}
+
+CRITICAL REQUIREMENT:
+⚠️ You MUST generate EXACTLY ${questionCount} questions. Not ${questionCount - 1}, not ${questionCount + 1}, but EXACTLY ${questionCount}.
+⚠️ If you generate fewer than ${questionCount} questions, the quiz will fail validation.
+⚠️ Count your questions before responding to ensure you have exactly ${questionCount}.
 
 IMPORTANT RULES:
 1. Questions must be based ONLY on the provided content - do NOT add external information
@@ -1534,6 +1539,20 @@ app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) =
 
     if (!parsed.questions || !Array.isArray(parsed.questions)) {
       return res.status(500).json({ error: "We're sorry, the AI couldn't generate proper questions. Please try again." });
+    }
+
+    // Validate question count
+    const receivedCount = parsed.questions.length;
+    const requestedCount = config.questionCount;
+    
+    console.log(`[AI Reviewer] Requested: ${requestedCount} questions, Received: ${receivedCount} questions`);
+    
+    if (receivedCount < requestedCount) {
+      console.warn(`[AI Reviewer] AI generated fewer questions than requested (${receivedCount}/${requestedCount})`);
+      // Return error asking to try again or reduce question count
+      return res.status(500).json({ 
+        error: `The AI only generated ${receivedCount} questions instead of ${requestedCount}. This can happen with complex content. Please try again or reduce the question count.` 
+      });
     }
 
     // Shuffle array helper
