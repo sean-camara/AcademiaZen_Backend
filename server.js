@@ -50,6 +50,16 @@ const checkoutLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Stricter rate limit for AI Reviewer (uses paid API)
+const reviewerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour window
+  limit: 10, // Max 10 reviewer generations per hour per user
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.uid || req.ip, // Rate limit by user ID
+  message: { error: 'Too many reviewer requests. Please wait before creating more reviewers.' },
+});
+
 app.use(express.json({
   limit: '15mb',
   verify: (req, res, buf) => {
@@ -252,6 +262,11 @@ const AI_MAX_TOKENS_DEEP = Number(process.env.AI_MAX_TOKENS_DEEP || 2400);
 const OPENROUTER_API_KEY = resolveEnvRef(process.env.OPENROUTER_API_KEY || process.env.DEEPSEEK_API_KEY);
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || process.env.FRONTEND_URL || 'https://academiazen.app';
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || 'AcademiaZen';
+
+// DeepSeek Direct API for AI Reviewer (separate from OpenRouter to control costs)
+const DEEPSEEK_REVIEWER_API_KEY = resolveEnvRef(process.env.DEEPSEEK_REVIEWER_API_KEY);
+const DEEPSEEK_REVIEWER_BASE_URL = process.env.DEEPSEEK_REVIEWER_BASE_URL || 'https://api.deepseek.com/v1';
+const DEEPSEEK_REVIEWER_MODEL = process.env.DEEPSEEK_REVIEWER_MODEL || 'deepseek-chat';
 
 const R2_ENDPOINT = process.env.R2_ENDPOINT || '';
 const R2_BUCKET = process.env.R2_BUCKET || '';
@@ -480,6 +495,37 @@ async function openrouterRequest(path, { method = 'POST', body } = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = data?.error?.message || data?.error || data?.message || 'AI request failed';
+    const error = new Error(message);
+    error.statusCode = response.status;
+    error.payload = data;
+    throw error;
+  }
+  return data;
+}
+
+// DeepSeek Direct API for AI Reviewer (separate from OpenRouter)
+async function deepseekReviewerRequest(messages, maxTokens = 8000) {
+  if (!DEEPSEEK_REVIEWER_API_KEY) {
+    throw new Error('DEEPSEEK_REVIEWER_API_KEY is not configured');
+  }
+
+  const response = await fetch(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${DEEPSEEK_REVIEWER_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: DEEPSEEK_REVIEWER_MODEL,
+      max_tokens: maxTokens,
+      temperature: 0.3,
+      messages,
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data?.error?.message || data?.error || data?.message || 'DeepSeek API request failed';
     const error = new Error(message);
     error.statusCode = response.status;
     error.payload = data;
@@ -1452,7 +1498,7 @@ Respond with ONLY valid JSON in this format:
 }`;
 }
 
-app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) => {
+app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, async (req, res) => {
   try {
     const { pdfText, config, reviewerId } = req.body;
     
@@ -1483,28 +1529,21 @@ app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) =
 
     const prompt = buildReviewerPrompt(pdfText, config);
     
-    // Use the chat model (not reasoning model) for quiz generation
-    const reviewerModel = AI_MODEL_FAST; // deepseek-chat works better for structured JSON output
-    
-    console.log('[AI Reviewer] Starting generation with model:', reviewerModel);
+    // Use DeepSeek Direct API (paid, separate from OpenRouter used by ZenAI chat)
+    console.log('[AI Reviewer] Starting generation with DeepSeek Direct API');
+    console.log('[AI Reviewer] Model:', DEEPSEEK_REVIEWER_MODEL);
     console.log('[AI Reviewer] PDF text length:', pdfText.length);
     console.log('[AI Reviewer] Config:', JSON.stringify(config));
-    
-    const payload = {
-      model: reviewerModel,
-      max_tokens: AI_REVIEWER_MAX_TOKENS,
-      temperature: 0.3,
-      messages: [
-        { role: 'user', content: prompt },
-      ],
-    };
 
     let data;
     try {
-      data = await openrouterRequest('/chat/completions', { method: 'POST', body: payload });
+      data = await deepseekReviewerRequest(
+        [{ role: 'user', content: prompt }],
+        AI_REVIEWER_MAX_TOKENS
+      );
       console.log('[AI Reviewer] API response received, choices:', data?.choices?.length);
     } catch (apiErr) {
-      console.error('[AI Reviewer] API call failed:', apiErr.message);
+      console.error('[AI Reviewer] DeepSeek API call failed:', apiErr.message);
       console.error('[AI Reviewer] API error payload:', JSON.stringify(apiErr.payload || {}));
       return res.status(500).json({ error: "AI service temporarily unavailable. Please try again in a moment." });
     }
