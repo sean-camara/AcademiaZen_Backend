@@ -273,15 +273,22 @@ const PAYMONGO_SECRET_KEY = resolveEnvRef(process.env.PAYMONGO_SECRET_KEY);
 const PAYMONGO_API_BASE = process.env.PAYMONGO_API_BASE || 'https://api.paymongo.com/v1';
 const PAYMONGO_WEBHOOK_SECRET = resolveEnvRef(process.env.PAYMONGO_WEBHOOK_SECRET);
 
-const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'premium').toLowerCase();
+const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
 const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
 const MAX_AI_PROMPT_CHARS = Number(process.env.MAX_AI_PROMPT_CHARS || 12000);
+const MAX_AI_PROMPT_CHARS_FREE = Number(process.env.MAX_AI_PROMPT_CHARS_FREE || 3000);
 const AI_BASE_URL = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
 const AI_MODEL_DEFAULT = process.env.AI_MODEL || 'deepseek/deepseek-r1-0528:free';
 const AI_MODEL_FAST = process.env.AI_MODEL_FAST || 'deepseek/deepseek-chat';
 const AI_MODEL_DEEP = process.env.AI_MODEL_DEEP || AI_MODEL_DEFAULT;
+const AI_MODEL_FREE_FAST = process.env.AI_MODEL_FREE_FAST || AI_MODEL_FAST;
+const AI_MODEL_FREE_DEEP = process.env.AI_MODEL_FREE_DEEP || AI_MODEL_DEEP;
+const AI_MODEL_PREMIUM_FAST = process.env.AI_MODEL_PREMIUM_FAST || 'deepseek-chat';
+const AI_MODEL_PREMIUM_DEEP = process.env.AI_MODEL_PREMIUM_DEEP || 'deepseek-reasoner';
 const AI_MAX_TOKENS_FAST = Number(process.env.AI_MAX_TOKENS_FAST || 1200);
 const AI_MAX_TOKENS_DEEP = Number(process.env.AI_MAX_TOKENS_DEEP || 2400);
+const AI_MAX_TOKENS_FREE_FAST = Number(process.env.AI_MAX_TOKENS_FREE_FAST || 800);
+const AI_MAX_TOKENS_FREE_DEEP = Number(process.env.AI_MAX_TOKENS_FREE_DEEP || 1200);
 const OPENROUTER_API_KEY = resolveEnvRef(process.env.OPENROUTER_API_KEY || process.env.DEEPSEEK_API_KEY);
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || process.env.FRONTEND_URL || 'https://academiazen.app';
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || 'AcademiaZen';
@@ -542,6 +549,36 @@ async function deepseekReviewerRequest(messages, maxTokens = 8000) {
       model: DEEPSEEK_REVIEWER_MODEL,
       max_tokens: maxTokens,
       temperature: 0.3,
+      messages,
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data?.error?.message || data?.error || data?.message || 'DeepSeek API request failed';
+    const error = new Error(message);
+    error.statusCode = response.status;
+    error.payload = data;
+    throw error;
+  }
+  return data;
+}
+
+async function deepseekChatRequest(model, messages, maxTokens = 1200, temperature = 0.5) {
+  if (!DEEPSEEK_REVIEWER_API_KEY) {
+    throw new Error('DEEPSEEK_REVIEWER_API_KEY is not configured');
+  }
+
+  const response = await fetch(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${DEEPSEEK_REVIEWER_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: maxTokens,
+      temperature,
       messages,
     }),
   });
@@ -1361,29 +1398,44 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required' });
     }
-    if (prompt.length > MAX_AI_PROMPT_CHARS) {
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    if (!ALLOW_FREE_AI && !hasPremium) {
+      return res.status(402).json({ error: 'Premium subscription required' });
+    }
+
+    const isDeep = mode === 'deep';
+    const maxPromptChars = hasPremium ? MAX_AI_PROMPT_CHARS : MAX_AI_PROMPT_CHARS_FREE;
+    if (prompt.length > maxPromptChars) {
       return res.status(413).json({ error: 'Prompt is too long' });
     }
-    if (!ALLOW_FREE_AI) {
-      const user = await getOrCreateUser(req.user.uid, req.user.email);
-      const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
-      if (!hasPremium) {
-        return res.status(402).json({ error: 'Premium subscription required' });
-      }
-    }
-    const isDeep = mode === 'deep';
-    const selectedModel = isDeep ? AI_MODEL_DEEP : AI_MODEL_FAST;
-    const maxTokens = isDeep ? AI_MAX_TOKENS_DEEP : AI_MAX_TOKENS_FAST;
-    const payload = {
-      model: selectedModel,
-      max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1200,
-      temperature: isDeep ? 0.2 : 0.5,
-      messages: [
-        { role: 'user', content: prompt },
-      ],
-    };
 
-    const data = await openrouterRequest('/chat/completions', { method: 'POST', body: payload });
+    const temperature = isDeep ? 0.2 : 0.5;
+
+    let data;
+    if (hasPremium) {
+      const selectedModel = isDeep ? AI_MODEL_PREMIUM_DEEP : AI_MODEL_PREMIUM_FAST;
+      const maxTokens = isDeep ? AI_MAX_TOKENS_DEEP : AI_MAX_TOKENS_FAST;
+      data = await deepseekChatRequest(
+        selectedModel,
+        [{ role: 'user', content: prompt }],
+        Number.isFinite(maxTokens) ? maxTokens : 1200,
+        temperature
+      );
+    } else {
+      const selectedModel = isDeep ? AI_MODEL_FREE_DEEP : AI_MODEL_FREE_FAST;
+      const maxTokens = isDeep ? AI_MAX_TOKENS_FREE_DEEP : AI_MAX_TOKENS_FREE_FAST;
+      const payload = {
+        model: selectedModel,
+        max_tokens: Number.isFinite(maxTokens) ? maxTokens : 800,
+        temperature,
+        messages: [
+          { role: 'user', content: prompt },
+        ],
+      };
+      data = await openrouterRequest('/chat/completions', { method: 'POST', body: payload });
+    }
+
     const text = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || '';
     res.json({ text });
   } catch (err) {
