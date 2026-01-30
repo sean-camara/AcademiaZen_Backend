@@ -1302,9 +1302,12 @@ app.post('/api/sync-tasks', requireAuth, async (req, res) => {
   }
 
   try {
-    const user = await getOrCreateUser(req.user.uid, req.user.email);
-    user.state.tasks = tasks;
-    await user.save();
+    // Use findOneAndUpdate to avoid version conflicts
+    await User.findOneAndUpdate(
+      { uid: req.user.uid },
+      { $set: { 'state.tasks': tasks } },
+      { new: true }
+    );
     res.json({ success: true, syncedTasks: tasks.length });
   } catch (err) {
     console.error('Sync tasks failed:', err);
