@@ -1363,7 +1363,7 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
 
 // ----- AI Reviewer Generation -----
 const MAX_AI_REVIEWERS = 10;
-const AI_REVIEWER_MAX_TOKENS = 12000; // Increased to handle 10+ questions reliably
+const AI_REVIEWER_MAX_TOKENS = 8192; // DeepSeek API max limit
 
 function buildReviewerPrompt(pdfText, config) {
   const { questionCount, difficulty, questionMode } = config;
