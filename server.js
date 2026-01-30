@@ -1547,12 +1547,17 @@ app.post('/api/ai/generate-reviewer', requireAuth, aiLimiter, async (req, res) =
     
     console.log(`[AI Reviewer] Requested: ${requestedCount} questions, Received: ${receivedCount} questions`);
     
+    if (receivedCount === 0) {
+      console.error('[AI Reviewer] No questions were generated');
+      return res.status(500).json({ 
+        error: "The AI couldn't generate questions from this content. Please try a different PDF or configuration." 
+      });
+    }
+    
     if (receivedCount < requestedCount) {
       console.warn(`[AI Reviewer] AI generated fewer questions than requested (${receivedCount}/${requestedCount})`);
-      // Return error asking to try again or reduce question count
-      return res.status(500).json({ 
-        error: `The AI only generated ${receivedCount} questions instead of ${requestedCount}. This can happen with complex content. Please try again or reduce the question count.` 
-      });
+      // Log the discrepancy but continue with the questions we got
+      // The frontend will display whatever count was actually generated
     }
 
     // Shuffle array helper
