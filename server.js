@@ -431,7 +431,7 @@ function getBillingSnapshot(billing) {
 async function getFocusStreak(uid) {
   const sessions = await FocusSession.find({
     uid,
-    status: { $in: ['completed', 'failed', 'abandoned'] },
+    status: { $in: ['completed', 'partial', 'not_finished', 'failed', 'abandoned'] },
     endedAt: { $ne: null },
   })
     .sort({ endedAt: -1 })
@@ -440,7 +440,8 @@ async function getFocusStreak(uid) {
 
   let streak = 0;
   for (const session of sessions) {
-    if (session.status === 'completed') {
+    // Only fully completed sessions count toward streak
+    if (session.status === 'completed' || session.completionStatus === 'completed') {
       streak += 1;
     } else {
       break;
@@ -455,9 +456,96 @@ async function getTargetQuitCount(uid, targetType, targetId, days = 7) {
     uid,
     targetType,
     targetId,
-    status: { $in: ['failed', 'abandoned'] },
+    status: { $in: ['not_finished', 'failed', 'abandoned'] },
     endedAt: { $gte: since },
   });
+}
+
+// Get focus analytics for a user
+async function getFocusAnalytics(uid) {
+  const now = new Date();
+  const startOfWeek = new Date(now);
+  startOfWeek.setDate(now.getDate() - now.getDay());
+  startOfWeek.setHours(0, 0, 0, 0);
+  
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  
+  // Get all completed sessions
+  const allSessions = await FocusSession.find({
+    uid,
+    status: { $in: ['completed', 'partial'] },
+    endedAt: { $ne: null },
+  }).lean();
+  
+  // This week's sessions
+  const weekSessions = allSessions.filter(s => new Date(s.endedAt) >= startOfWeek);
+  const weekMinutes = Math.round(weekSessions.reduce((sum, s) => sum + (s.actualDurationSeconds || 0), 0) / 60);
+  
+  // This month's sessions
+  const monthSessions = allSessions.filter(s => new Date(s.endedAt) >= startOfMonth);
+  const monthMinutes = Math.round(monthSessions.reduce((sum, s) => sum + (s.actualDurationSeconds || 0), 0) / 60);
+  
+  // Total all time
+  const totalMinutes = Math.round(allSessions.reduce((sum, s) => sum + (s.actualDurationSeconds || 0), 0) / 60);
+  
+  // Sessions count
+  const totalSessions = allSessions.length;
+  const weekSessionsCount = weekSessions.length;
+  
+  // Completion rate
+  const allEndedSessions = await FocusSession.countDocuments({ uid, endedAt: { $ne: null } });
+  const completedSessions = await FocusSession.countDocuments({ 
+    uid, 
+    status: { $in: ['completed', 'partial'] },
+    endedAt: { $ne: null } 
+  });
+  const completionRate = allEndedSessions > 0 ? completedSessions / allEndedSessions : 0;
+  
+  // Most common blockers
+  const blockerPipeline = await FocusSession.aggregate([
+    { $match: { uid, blockerChips: { $exists: true, $ne: [] } } },
+    { $unwind: '$blockerChips' },
+    { $group: { _id: '$blockerChips', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 5 }
+  ]);
+  const topBlockers = blockerPipeline.map(b => ({ blocker: b._id, count: b.count }));
+  
+  // Daily breakdown for the week (for graph)
+  const dailyBreakdown = [];
+  for (let i = 6; i >= 0; i--) {
+    const dayStart = new Date(now);
+    dayStart.setDate(now.getDate() - i);
+    dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart);
+    dayEnd.setHours(23, 59, 59, 999);
+    
+    const daySessions = allSessions.filter(s => {
+      const ended = new Date(s.endedAt);
+      return ended >= dayStart && ended <= dayEnd;
+    });
+    
+    dailyBreakdown.push({
+      date: dayStart.toISOString().split('T')[0],
+      dayName: dayStart.toLocaleDateString('en-US', { weekday: 'short' }),
+      minutes: Math.round(daySessions.reduce((sum, s) => sum + (s.actualDurationSeconds || 0), 0) / 60),
+      sessions: daySessions.length
+    });
+  }
+  
+  const streak = await getFocusStreak(uid);
+  
+  return {
+    weekMinutes,
+    monthMinutes,
+    totalMinutes,
+    totalSessions,
+    weekSessionsCount,
+    completionRate,
+    topBlockers,
+    dailyBreakdown,
+    streak
+  };
 }
 
 function applyPaidSubscription(user, interval, details = {}) {
@@ -1155,6 +1243,9 @@ app.post('/api/focus/sessions/start', requireAuth, async (req, res) => {
       targetMeta,
       plannedDurationMinutes,
       startedAt: new Date(),
+      pomodoroMode: req.body.pomodoroMode || null,
+      cycleNumber: req.body.cycleNumber || 1,
+      isBreak: req.body.isBreak || false,
     });
 
     res.json({ sessionId: session._id.toString(), startedAt: session.startedAt });
@@ -1164,11 +1255,75 @@ app.post('/api/focus/sessions/start', requireAuth, async (req, res) => {
   }
 });
 
+// New endpoint: End session with completion status (replaces old complete/abandon)
+app.post('/api/focus/sessions/end', requireAuth, async (req, res) => {
+  try {
+    const { 
+      sessionId, 
+      completionStatus, // 'completed' | 'partial' | 'not_finished'
+      blockerChips = [], // Array of blocker strings
+      reflectionText = '' // Optional text
+    } = req.body || {};
+    
+    if (!sessionId || !completionStatus) {
+      return res.status(400).json({ error: 'sessionId and completionStatus are required' });
+    }
+    
+    if (!['completed', 'partial', 'not_finished'].includes(completionStatus)) {
+      return res.status(400).json({ error: 'Invalid completionStatus' });
+    }
+    
+    const session = await FocusSession.findOne({ _id: sessionId, uid: req.user.uid });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (session.status !== 'in_progress') {
+      return res.status(400).json({ error: 'Session is not active' });
+    }
+
+    const endedAt = new Date();
+    session.status = completionStatus;
+    session.completionStatus = completionStatus;
+    session.endedAt = endedAt;
+    session.actualDurationSeconds = session.startedAt ? Math.max(1, Math.round((endedAt - session.startedAt) / 1000)) : 0;
+    session.blockerChips = blockerChips;
+    session.reflectionText = reflectionText;
+    // Legacy field mapping
+    session.reflectionType = completionStatus === 'completed' ? 'finished' : 'blocked';
+    await session.save();
+
+    // Mark task as completed only if fully completed
+    if (completionStatus === 'completed' && session.targetType === 'task') {
+      const user = await getOrCreateUser(req.user.uid, req.user.email);
+      user.state.tasks = (user.state.tasks || []).map(task =>
+        task.id === session.targetId ? { ...task, completed: true } : task
+      );
+      await user.save();
+    }
+
+    const streak = await getFocusStreak(req.user.uid);
+    const analytics = await getFocusAnalytics(req.user.uid);
+    
+    res.json({ 
+      success: true, 
+      streak,
+      sessionSummary: {
+        duration: session.actualDurationSeconds,
+        completionStatus,
+        targetLabel: session.targetLabel
+      },
+      analytics
+    });
+  } catch (err) {
+    console.error('Failed to end focus session:', err);
+    res.status(500).json({ error: 'Failed to end focus session' });
+  }
+});
+
+// Keep legacy complete endpoint for backward compatibility
 app.post('/api/focus/sessions/complete', requireAuth, async (req, res) => {
   try {
-    const { sessionId, reflectionText } = req.body || {};
-    if (!sessionId || !reflectionText) {
-      return res.status(400).json({ error: 'sessionId and reflectionText are required' });
+    const { sessionId, reflectionText = '' } = req.body || {};
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
     }
     const session = await FocusSession.findOne({ _id: sessionId, uid: req.user.uid });
     if (!session) return res.status(404).json({ error: 'Session not found' });
@@ -1178,6 +1333,7 @@ app.post('/api/focus/sessions/complete', requireAuth, async (req, res) => {
 
     const endedAt = new Date();
     session.status = 'completed';
+    session.completionStatus = 'completed';
     session.endedAt = endedAt;
     session.actualDurationSeconds = session.startedAt ? Math.max(1, Math.round((endedAt - session.startedAt) / 1000)) : 0;
     session.reflectionType = 'finished';
@@ -1200,11 +1356,12 @@ app.post('/api/focus/sessions/complete', requireAuth, async (req, res) => {
   }
 });
 
+// Keep legacy abandon endpoint for backward compatibility
 app.post('/api/focus/sessions/abandon', requireAuth, async (req, res) => {
   try {
-    const { sessionId, reflectionText } = req.body || {};
-    if (!sessionId || !reflectionText) {
-      return res.status(400).json({ error: 'sessionId and reflectionText are required' });
+    const { sessionId, reflectionText = '' } = req.body || {};
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
     }
     const session = await FocusSession.findOne({ _id: sessionId, uid: req.user.uid });
     if (!session) return res.status(404).json({ error: 'Session not found' });
@@ -1214,6 +1371,7 @@ app.post('/api/focus/sessions/abandon', requireAuth, async (req, res) => {
 
     const endedAt = new Date();
     session.status = 'abandoned';
+    session.completionStatus = 'not_finished';
     session.endedAt = endedAt;
     session.actualDurationSeconds = session.startedAt ? Math.max(1, Math.round((endedAt - session.startedAt) / 1000)) : 0;
     session.reflectionType = 'blocked';
@@ -1225,6 +1383,144 @@ app.post('/api/focus/sessions/abandon', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('Failed to abandon focus session:', err);
     res.status(500).json({ error: 'Failed to abandon focus session' });
+  }
+});
+
+// New endpoint: Get focus analytics
+app.get('/api/focus/analytics', requireAuth, async (req, res) => {
+  try {
+    const analytics = await getFocusAnalytics(req.user.uid);
+    res.json(analytics);
+  } catch (err) {
+    console.error('Failed to load focus analytics:', err);
+    res.status(500).json({ error: 'Failed to load focus analytics' });
+  }
+});
+
+// New endpoint: Get focus history (paginated)
+app.get('/api/focus/history', requireAuth, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const skip = (page - 1) * limit;
+    
+    const sessions = await FocusSession.find({
+      uid: req.user.uid,
+      endedAt: { $ne: null },
+    })
+      .sort({ endedAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+    
+    const total = await FocusSession.countDocuments({
+      uid: req.user.uid,
+      endedAt: { $ne: null },
+    });
+    
+    res.json({
+      sessions: sessions.map(s => ({
+        id: s._id,
+        targetType: s.targetType,
+        targetId: s.targetId,
+        targetLabel: s.targetLabel,
+        status: s.status,
+        completionStatus: s.completionStatus || s.status,
+        plannedMinutes: s.plannedDurationMinutes,
+        actualMinutes: Math.round((s.actualDurationSeconds || 0) / 60),
+        blockerChips: s.blockerChips || [],
+        reflectionText: s.reflectionText || '',
+        startedAt: s.startedAt,
+        endedAt: s.endedAt,
+      })),
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (err) {
+    console.error('Failed to load focus history:', err);
+    res.status(500).json({ error: 'Failed to load focus history' });
+  }
+});
+
+// New endpoint: Get smart suggestions for what to focus on
+app.get('/api/focus/suggestions', requireAuth, async (req, res) => {
+  try {
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    const tasks = user.state?.tasks || [];
+    const now = new Date();
+    
+    // Sort tasks by priority
+    const suggestions = [];
+    
+    // 1. Overdue tasks
+    const overdueTasks = tasks
+      .filter(t => !t.completed && t.dueDate && new Date(t.dueDate) < now)
+      .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+    
+    overdueTasks.slice(0, 2).forEach(task => {
+      suggestions.push({
+        type: 'task',
+        id: task.id,
+        label: task.title,
+        reason: 'overdue',
+        priority: 1,
+        dueDate: task.dueDate
+      });
+    });
+    
+    // 2. Due within 3 days
+    const threeDaysFromNow = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+    const urgentTasks = tasks
+      .filter(t => !t.completed && t.dueDate && new Date(t.dueDate) >= now && new Date(t.dueDate) <= threeDaysFromNow)
+      .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+    
+    urgentTasks.slice(0, 2).forEach(task => {
+      if (!suggestions.find(s => s.id === task.id)) {
+        suggestions.push({
+          type: 'task',
+          id: task.id,
+          label: task.title,
+          reason: 'due_soon',
+          priority: 2,
+          dueDate: task.dueDate
+        });
+      }
+    });
+    
+    // 3. Recently worked on but not completed (unfinished sessions)
+    const recentSessions = await FocusSession.find({
+      uid: req.user.uid,
+      status: { $in: ['partial', 'not_finished', 'abandoned'] },
+      endedAt: { $gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) }
+    })
+      .sort({ endedAt: -1 })
+      .limit(5)
+      .lean();
+    
+    for (const session of recentSessions) {
+      if (session.targetType === 'task') {
+        const task = tasks.find(t => t.id === session.targetId && !t.completed);
+        if (task && !suggestions.find(s => s.id === task.id)) {
+          suggestions.push({
+            type: 'task',
+            id: task.id,
+            label: task.title,
+            reason: 'unfinished',
+            priority: 3,
+            lastAttempt: session.endedAt
+          });
+        }
+      }
+    }
+    
+    res.json({ suggestions: suggestions.slice(0, 5) });
+  } catch (err) {
+    console.error('Failed to load focus suggestions:', err);
+    res.status(500).json({ error: 'Failed to load focus suggestions' });
   }
 });
 
