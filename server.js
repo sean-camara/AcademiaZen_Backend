@@ -1796,9 +1796,133 @@ const aiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Build intelligent system prompt for Zen AI
+function buildZenSystemPrompt(user, hasPremium) {
+  const profile = user.state?.profile || {};
+  const settings = user.state?.settings || {};
+  const tasks = user.state?.tasks || [];
+  const subjects = user.state?.subjects || [];
+  const folders = user.state?.folders || [];
+  
+  // Get user's name
+  const userName = profile.name && profile.name !== 'Student' ? profile.name : null;
+  const university = profile.university || null;
+  
+  // Get upcoming tasks (due in next 7 days)
+  const now = new Date();
+  const weekFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const upcomingTasks = tasks
+    .filter(t => !t.completed && t.dueDate)
+    .filter(t => {
+      const due = new Date(t.dueDate);
+      return due >= now && due <= weekFromNow;
+    })
+    .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate))
+    .slice(0, 5);
+  
+  // Get overdue tasks
+  const overdueTasks = tasks
+    .filter(t => !t.completed && t.dueDate && new Date(t.dueDate) < now)
+    .slice(0, 3);
+  
+  // Get subject names for context
+  const subjectMap = new Map(subjects.map(s => [s.id, s.name]));
+  
+  // Build context sections
+  let contextSections = [];
+  
+  if (userName) {
+    contextSections.push(`The student's name is ${userName}.`);
+  }
+  if (university) {
+    contextSections.push(`They study at ${university}.`);
+  }
+  if (subjects.length > 0) {
+    contextSections.push(`Their subjects: ${subjects.map(s => s.name).join(', ')}.`);
+  }
+  
+  if (overdueTasks.length > 0) {
+    const overdueList = overdueTasks.map(t => {
+      const subj = t.subjectId ? subjectMap.get(t.subjectId) : null;
+      return subj ? `"${t.title}" (${subj})` : `"${t.title}"`;
+    }).join(', ');
+    contextSections.push(`⚠️ OVERDUE tasks: ${overdueList}. Gently remind them if relevant.`);
+  }
+  
+  if (upcomingTasks.length > 0) {
+    const upcomingList = upcomingTasks.map(t => {
+      const subj = t.subjectId ? subjectMap.get(t.subjectId) : null;
+      const due = new Date(t.dueDate);
+      const daysUntil = Math.ceil((due - now) / (1000 * 60 * 60 * 24));
+      const dueLabel = daysUntil === 0 ? 'today' : daysUntil === 1 ? 'tomorrow' : `in ${daysUntil} days`;
+      return subj ? `"${t.title}" (${subj}, due ${dueLabel})` : `"${t.title}" (due ${dueLabel})`;
+    }).join(', ');
+    contextSections.push(`Upcoming tasks: ${upcomingList}.`);
+  }
+  
+  const userContext = contextSections.length > 0 
+    ? `\n\nCURRENT USER CONTEXT:\n${contextSections.join('\n')}`
+    : '';
+
+  const tierNote = hasPremium 
+    ? 'This is a PREMIUM user - provide comprehensive, detailed responses.'
+    : 'This is a FREE tier user - still be helpful but responses can be slightly more concise.';
+
+  return `You are Zen, an intelligent AI study companion for AcademiaZen - a student productivity app. You are warm, encouraging, and genuinely helpful like a supportive tutor and friend.
+
+PERSONALITY & COMMUNICATION STYLE:
+- Be conversational, friendly, and approachable - like a smart friend who's great at explaining things
+- Anticipate what the student might need next and offer proactive suggestions
+- Use the student's name occasionally if known to make it personal
+- Be encouraging about their academic journey without being patronizing
+- When explaining concepts, use clear examples and analogies
+- If they seem stressed about deadlines, be reassuring while helping them prioritize
+- Match their energy - if they're casual, be casual; if they're serious, be more focused
+
+CAPABILITIES - You can help with:
+- Explaining any academic concept in any subject (science, math, humanities, programming, etc.)
+- Answering questions about their uploaded documents/PDFs
+- Helping plan study sessions and manage time
+- Breaking down complex topics into digestible parts
+- Providing study tips, memory techniques, and learning strategies
+- Helping with homework and assignments (explain approach, not just answers)
+- Writing assistance (essays, reports, thesis help)
+- Programming help (code explanations, debugging, best practices)
+- Test/exam preparation strategies
+- Motivation and productivity advice
+
+RESPONSE GUIDELINES:
+- Be direct and get to the point - students are busy
+- Use markdown formatting for clarity (headers, bullet points, code blocks)
+- For code, ALWAYS use proper code blocks with language specification
+- If asked about their tasks/deadlines, reference the context provided
+- If you don't know something, say so honestly
+- Keep responses focused but thorough - quality over quantity
+
+CREATOR INFO (only if asked):
+- Created by Sean John Camara, STI College Fairview, BS Computer Science
+- Tech stack: MERN (MongoDB, Express, React, Node.js)
+
+${tierNote}
+${userContext}`;
+}
+
+// Convert chat history to API message format
+function formatChatHistory(history, maxMessages = 10) {
+  if (!Array.isArray(history) || history.length === 0) return [];
+  
+  // Take last N messages for context
+  const recent = history.slice(-maxMessages);
+  
+  return recent.map(msg => ({
+    role: msg.role === 'ai' ? 'assistant' : 'user',
+    content: msg.text || ''
+  })).filter(m => m.content.trim());
+}
+
 app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
   try {
-    const { prompt, mode } = req.body;
+    const { prompt, mode, history } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required' });
     }
@@ -1814,7 +1938,21 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
       return res.status(413).json({ error: 'Prompt is too long' });
     }
 
-    const temperature = isDeep ? 0.2 : 0.5;
+    const temperature = isDeep ? 0.3 : 0.6;
+    
+    // Build system prompt with user context
+    const systemPrompt = buildZenSystemPrompt(user, hasPremium);
+    
+    // Format conversation history for memory
+    const maxHistoryMessages = hasPremium ? 12 : 6;
+    const chatHistory = formatChatHistory(history, maxHistoryMessages);
+    
+    // Build messages array: system + history + current prompt
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...chatHistory,
+      { role: 'user', content: prompt }
+    ];
 
     let data;
     if (hasPremium) {
@@ -1822,7 +1960,7 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
       const maxTokens = isDeep ? AI_MAX_TOKENS_DEEP : AI_MAX_TOKENS_FAST;
       data = await deepseekChatRequest(
         selectedModel,
-        [{ role: 'user', content: prompt }],
+        messages,
         Number.isFinite(maxTokens) ? maxTokens : 1200,
         temperature
       );
@@ -1833,9 +1971,7 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
         model: selectedModel,
         max_tokens: Number.isFinite(maxTokens) ? maxTokens : 800,
         temperature,
-        messages: [
-          { role: 'user', content: prompt },
-        ],
+        messages,
       };
       data = await openrouterRequest('/chat/completions', { method: 'POST', body: payload });
     }
