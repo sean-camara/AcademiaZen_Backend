@@ -23,6 +23,7 @@ const { requireAuth, requireAdmin, initFirebaseAdmin } = require('./middleware/a
 const { User, getDefaultState } = require('./models/User');
 const { FocusSession } = require('./models/FocusSession');
 const PushSubscription = require('./models/PushSubscription');
+const { AILog } = require('./models/AILog');
 
 const app = express();
 
@@ -59,6 +60,162 @@ const reviewerLimiter = rateLimit({
   keyGenerator: (req) => req.user?.uid || req.ip, // Rate limit by user ID
   message: { error: 'Too many reviewer requests. Please wait before creating more reviewers.' },
 });
+
+// ========== AI USAGE LIMITS (Per-User Quota System) ==========
+const AI_LIMITS = {
+  free: {
+    requestsPerMinute: 5,      // Max 5 requests per minute
+    dailyCap: 30,              // Max 30 requests per day
+    monthlyCap: 500,           // Soft cap for analytics
+  },
+  premium: {
+    requestsPerMinute: 15,     // Max 15 requests per minute
+    dailyCap: 200,             // Max 200 requests per day
+    monthlyCap: null,          // Unlimited
+  },
+};
+
+/**
+ * AI Usage Guard Middleware
+ * Enforces per-user rate limiting and daily quotas
+ * Must be used AFTER requireAuth middleware
+ */
+async function aiUsageGuard(req, res, next) {
+  try {
+    const uid = req.user?.uid;
+    if (!uid) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const user = await User.findOne({ uid });
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    // Determine user tier
+    const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    const limits = hasPremium ? AI_LIMITS.premium : AI_LIMITS.free;
+    
+    // Initialize aiUsage if not exists
+    if (!user.aiUsage) {
+      user.aiUsage = {};
+    }
+
+    const now = new Date();
+    const todayStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+    const monthStr = todayStr.substring(0, 7); // YYYY-MM
+
+    // Reset daily count if new day
+    if (user.aiUsage.dailyResetDate !== todayStr) {
+      user.aiUsage.dailyCount = 0;
+      user.aiUsage.dailyResetDate = todayStr;
+    }
+
+    // Reset monthly count if new month
+    if (user.aiUsage.monthlyResetDate !== monthStr) {
+      user.aiUsage.monthlyCount = 0;
+      user.aiUsage.monthlyResetDate = monthStr;
+    }
+
+    // Check requests per minute
+    const minuteAgo = new Date(now.getTime() - 60 * 1000);
+    if (user.aiUsage.minuteResetAt && new Date(user.aiUsage.minuteResetAt) > minuteAgo) {
+      if (user.aiUsage.requestsThisMinute >= limits.requestsPerMinute) {
+        const retryAfter = Math.ceil((new Date(user.aiUsage.minuteResetAt).getTime() - now.getTime()) / 1000);
+        return res.status(429).json({
+          error: 'rate_limited',
+          message: `Too many requests. Please wait ${retryAfter} seconds.`,
+          retryAfter,
+        });
+      }
+    } else {
+      // Reset minute counter
+      user.aiUsage.requestsThisMinute = 0;
+      user.aiUsage.minuteResetAt = new Date(now.getTime() + 60 * 1000);
+    }
+
+    // Check daily cap
+    if (user.aiUsage.dailyCount >= limits.dailyCap) {
+      const resetTime = new Date(todayStr + 'T00:00:00Z');
+      resetTime.setDate(resetTime.getDate() + 1);
+      return res.status(429).json({
+        error: 'daily_quota_exceeded',
+        message: hasPremium 
+          ? 'Daily AI limit reached. Resets at midnight UTC.'
+          : 'Daily AI limit reached. Upgrade to Premium for more requests.',
+        resetAt: resetTime.toISOString(),
+        upgrade: !hasPremium,
+      });
+    }
+
+    // Increment counters (will be saved after successful request)
+    user.aiUsage.requestsThisMinute = (user.aiUsage.requestsThisMinute || 0) + 1;
+    user.aiUsage.dailyCount = (user.aiUsage.dailyCount || 0) + 1;
+    user.aiUsage.monthlyCount = (user.aiUsage.monthlyCount || 0) + 1;
+    user.aiUsage.totalRequests = (user.aiUsage.totalRequests || 0) + 1;
+    user.aiUsage.lastRequestAt = now;
+
+    // Attach user and tier to request for downstream use
+    req.zenUser = user;
+    req.zenTier = hasPremium ? 'premium' : 'free';
+    req.zenLimits = limits;
+
+    // Save usage update
+    await user.save();
+
+    next();
+  } catch (err) {
+    console.error('[aiUsageGuard] Error:', err);
+    // Don't block on guard errors - fail open but log
+    next();
+  }
+}
+
+/**
+ * Log AI request after completion
+ */
+async function logAIRequest(uid, endpoint, details) {
+  try {
+    await AILog.create({
+      uid,
+      endpoint,
+      model: details.model || '',
+      mode: details.mode || '',
+      promptTokens: details.promptTokens || 0,
+      completionTokens: details.completionTokens || 0,
+      totalTokens: details.totalTokens || 0,
+      estimatedCost: details.estimatedCost || 0,
+      promptLength: details.promptLength || 0,
+      responseLength: details.responseLength || 0,
+      success: details.success !== false,
+      errorCode: details.errorCode || '',
+      errorMessage: details.errorMessage || '',
+      responseTimeMs: details.responseTimeMs || 0,
+      userTier: details.userTier || 'free',
+    });
+  } catch (err) {
+    console.error('[logAIRequest] Failed to log:', err);
+  }
+}
+
+/**
+ * Update user's endpoint-specific counter
+ */
+async function incrementEndpointCounter(uid, endpoint) {
+  try {
+    const update = {};
+    if (endpoint === 'chat') {
+      update['aiUsage.totalChatRequests'] = 1;
+    } else if (endpoint === 'reviewer') {
+      update['aiUsage.totalReviewerRequests'] = 1;
+    }
+    if (Object.keys(update).length > 0) {
+      await User.updateOne({ uid }, { $inc: update });
+    }
+  } catch (err) {
+    console.error('[incrementEndpointCounter] Failed:', err);
+  }
+}
 
 app.use(express.json({
   limit: '15mb',
@@ -848,7 +1005,43 @@ app.get('/api/billing/plans', requireAuth, (req, res) => {
 app.get('/api/billing/status', requireAuth, async (req, res) => {
   try {
     const user = await getOrCreateUser(req.user.uid, req.user.email);
-    res.json({ billing: getBillingSnapshot(user.billing || {}) });
+    const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    const limits = hasPremium ? AI_LIMITS.premium : AI_LIMITS.free;
+    
+    // Get current AI usage with lazy reset
+    const aiUsage = user.aiUsage || {};
+    const now = new Date();
+    const today = now.toISOString().split('T')[0];
+    const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    
+    // Calculate effective counts (with lazy reset logic)
+    let dailyCount = aiUsage.dailyCount || 0;
+    let monthlyCount = aiUsage.monthlyCount || 0;
+    
+    if (aiUsage.lastResetDate !== today) {
+      dailyCount = 0;
+    }
+    if (aiUsage.lastResetMonth !== currentMonth) {
+      monthlyCount = 0;
+    }
+    
+    const aiUsageInfo = {
+      dailyCount,
+      dailyCap: limits.dailyCap,
+      dailyRemaining: Math.max(0, limits.dailyCap - dailyCount),
+      monthlyCount,
+      monthlyCap: limits.monthlySoftCap,
+      monthlyRemaining: hasPremium ? 'unlimited' : Math.max(0, limits.monthlySoftCap - monthlyCount),
+      perMinuteLimit: limits.perMinute,
+      totalRequests: aiUsage.totalRequests || 0,
+      totalChatRequests: aiUsage.totalChatRequests || 0,
+      totalReviewerRequests: aiUsage.totalReviewerRequests || 0
+    };
+    
+    res.json({ 
+      billing: getBillingSnapshot(user.billing || {}),
+      aiUsage: aiUsageInfo
+    });
   } catch (err) {
     console.error('Failed to get billing status:', err);
     res.status(500).json({ error: 'Failed to load billing status' });
@@ -1932,13 +2125,18 @@ function formatChatHistory(history, maxMessages = 10) {
   })).filter(m => m.content.trim());
 }
 
-app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
+app.post('/api/ai/chat', requireAuth, aiLimiter, aiUsageGuard, async (req, res) => {
+  const startTime = Date.now();
+  let logDetails = { userTier: req.zenTier || 'free', endpoint: 'chat' };
+  
   try {
     const { prompt, mode, history } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required' });
     }
-    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    
+    // Use cached user from guard if available
+    const user = req.zenUser || await getOrCreateUser(req.user.uid, req.user.email);
     const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
     if (!ALLOW_FREE_AI && !hasPremium) {
       return res.status(402).json({ error: 'Premium subscription required' });
@@ -1949,6 +2147,9 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
     if (prompt.length > maxPromptChars) {
       return res.status(413).json({ error: 'Prompt is too long' });
     }
+
+    logDetails.mode = isDeep ? 'deep' : 'fast';
+    logDetails.promptLength = prompt.length;
 
     const temperature = isDeep ? 0.3 : 0.6;
     
@@ -1989,9 +2190,30 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, async (req, res) => {
     }
 
     const text = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || '';
+    
+    // Log successful request
+    logDetails.model = hasPremium ? (isDeep ? AI_MODEL_PREMIUM_DEEP : AI_MODEL_PREMIUM_FAST) : (isDeep ? AI_MODEL_FREE_DEEP : AI_MODEL_FREE_FAST);
+    logDetails.responseLength = text.length;
+    logDetails.responseTimeMs = Date.now() - startTime;
+    logDetails.promptTokens = data?.usage?.prompt_tokens || 0;
+    logDetails.completionTokens = data?.usage?.completion_tokens || 0;
+    logDetails.totalTokens = data?.usage?.total_tokens || 0;
+    logDetails.success = true;
+    
+    // Log asynchronously (don't block response)
+    logAIRequest(req.user.uid, 'chat', logDetails);
+    incrementEndpointCounter(req.user.uid, 'chat');
+    
     res.json({ text });
   } catch (err) {
     console.error('AI proxy error:', err);
+    
+    // Log failed request
+    logDetails.success = false;
+    logDetails.errorMessage = err?.message || 'Unknown error';
+    logDetails.responseTimeMs = Date.now() - startTime;
+    logAIRequest(req.user.uid, 'chat', logDetails);
+    
     const status = err?.statusCode || 500;
     if (status === 402) {
       return res.status(402).json({ error: 'AI credits exhausted or token limit exceeded' });
@@ -2197,7 +2419,8 @@ app.get('/api/ai/reviewer-status', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, async (req, res) => {
+app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, aiUsageGuard, async (req, res) => {
+  const requestStartTime = Date.now();
   try {
     const { pdfText, config, reviewerId } = req.body;
     
@@ -2411,6 +2634,21 @@ app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, async (req, 
     // Calculate remaining generations for this window
     const remainingGenerations = maxGenerations - updatedGenerations.length;
 
+    // Log successful AI request
+    const responseTimeMs = Date.now() - requestStartTime;
+    const tokensUsed = data?.usage?.total_tokens || 0;
+    logAIRequest(req.user.uid, 'reviewer', {
+      model: hasPremium ? DEEPSEEK_REVIEWER_MODEL : AI_MODEL_FAST,
+      inputTokens: data?.usage?.prompt_tokens || 0,
+      outputTokens: data?.usage?.completion_tokens || 0,
+      totalTokens: tokensUsed,
+      success: true,
+      responseTimeMs,
+      userTier: hasPremium ? 'premium' : 'free',
+      metadata: { questionCount: questions.length, difficulty: finalConfig.difficulty, mode: finalConfig.questionMode }
+    });
+    incrementEndpointCounter(req.user.uid, 'reviewer');
+
     res.json({
       suggestedName: parsed.suggestedName || 'AI Reviewer',
       questions,
@@ -2421,6 +2659,20 @@ app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, async (req, 
   } catch (err) {
     console.error('AI reviewer generation error:', err);
     const status = err?.statusCode || 500;
+    
+    // Log failed request
+    const responseTimeMs = Date.now() - requestStartTime;
+    logAIRequest(req.user.uid, 'reviewer', {
+      model: 'unknown',
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      success: false,
+      responseTimeMs,
+      userTier: 'unknown',
+      errorMessage: err?.message || 'Unknown error'
+    });
+    
     if (status === 402) {
       return res.status(402).json({ error: 'AI credits exhausted. Please try again later.' });
     }

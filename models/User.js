@@ -152,6 +152,27 @@ const BillingSchema = new mongoose.Schema({
   },
 }, { _id: false });
 
+// AI Usage Tracking Schema - prevents abuse and tracks costs
+const AIUsageSchema = new mongoose.Schema({
+  // Daily tracking (resets at UTC midnight)
+  dailyCount: { type: Number, default: 0 },
+  dailyResetDate: { type: String, default: '' }, // YYYY-MM-DD format
+  
+  // Monthly tracking (for analytics)
+  monthlyCount: { type: Number, default: 0 },
+  monthlyResetDate: { type: String, default: '' }, // YYYY-MM format
+  
+  // Rate limiting
+  lastRequestAt: { type: Date, default: null },
+  requestsThisMinute: { type: Number, default: 0 },
+  minuteResetAt: { type: Date, default: null },
+  
+  // Lifetime stats
+  totalRequests: { type: Number, default: 0 },
+  totalChatRequests: { type: Number, default: 0 },
+  totalReviewerRequests: { type: Number, default: 0 },
+}, { _id: false });
+
 const ZenStateSchema = new mongoose.Schema({
   tasks: { type: [TaskSchema], default: [] },
   subjects: { type: [SubjectSchema], default: [] },
@@ -171,6 +192,7 @@ const UserSchema = new mongoose.Schema({
   state: { type: ZenStateSchema, default: () => getDefaultState() },
   notificationMeta: { type: NotificationMetaSchema, default: () => ({}) },
   billing: { type: BillingSchema, default: () => ({}) },
+  aiUsage: { type: AIUsageSchema, default: () => ({}) },
 }, { timestamps: true });
 
 function getDefaultState() {
