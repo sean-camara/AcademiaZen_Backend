@@ -1,7 +1,9 @@
-name: Deploy Backend (VPS)
+name: Deploy Backend
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+  workflow_dispatch: # Allow manual trigger
 
 concurrency:
   group: deploy-backend
@@ -11,7 +13,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy via SSH
+      - name: Deploy Backend via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -22,9 +24,17 @@ jobs:
           script: |
             set -e
             cd ${{ secrets.VPS_APP_PATH }}/AcademiaZen_Backend
+            
+            # Pull latest code
             git pull --ff-only
-            cd ${{ secrets.VPS_APP_PATH }}/AcademiaZen
-            git pull --ff-only
-            cd ${{ secrets.VPS_APP_PATH }}
-            docker compose build
-            docker compose up -d --remove-orphans
+            
+            # Install dependencies (production only, less memory)
+            npm install --production --silent
+            
+            # Restart backend with PM2
+            pm2 restart academiazen-backend --update-env || pm2 start server.js --name academiazen-backend
+            
+            # Save PM2 config
+            pm2 save
+            
+            echo "✅ Backend deployed successfully!"
