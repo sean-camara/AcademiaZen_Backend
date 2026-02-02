@@ -935,21 +935,48 @@ app.get('/api/vapid-public-key', (req, res) => {
 });
 
 // ----- R2 Uploads -----
+const FREE_MAX_UPLOAD_BYTES = 2 * 1024 * 1024; // 2MB for free users
+const PREMIUM_MAX_UPLOAD_BYTES = 15 * 1024 * 1024; // 15MB for premium users
+const ALLOWED_MIME_TYPES = ['application/pdf'];
+
 app.post('/api/uploads/presign', requireAuth, async (req, res) => {
   try {
     const { filename, contentType, size } = req.body || {};
     if (!filename || !contentType || !size) {
       return res.status(400).json({ error: 'filename, contentType, and size are required' });
     }
-    if (!String(contentType).includes('pdf')) {
-      return res.status(400).json({ error: 'Only PDF uploads are allowed' });
+    
+    // Strict MIME type validation
+    const normalizedType = String(contentType).toLowerCase().trim();
+    if (!ALLOWED_MIME_TYPES.includes(normalizedType) && !normalizedType.includes('pdf')) {
+      return res.status(400).json({ error: 'Only PDF files are allowed' });
     }
+    
+    // Validate filename extension
+    const ext = String(filename).toLowerCase().split('.').pop();
+    if (ext !== 'pdf') {
+      return res.status(400).json({ error: 'Only .pdf files are allowed' });
+    }
+    
     const sizeNum = Number(size);
     if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
-      return res.status(400).json({ error: 'Invalid size' });
+      return res.status(400).json({ error: 'Invalid file size' });
     }
-    if (sizeNum > MAX_UPLOAD_BYTES) {
-      return res.status(413).json({ error: 'File exceeds upload limit' });
+    
+    // Per-user file size limit based on billing plan
+    const user = await getOrCreateUser(req.user.uid, req.user.email);
+    const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    const maxBytes = hasPremium ? PREMIUM_MAX_UPLOAD_BYTES : FREE_MAX_UPLOAD_BYTES;
+    
+    if (sizeNum > maxBytes) {
+      const maxMB = Math.round(maxBytes / (1024 * 1024));
+      return res.status(413).json({ 
+        error: hasPremium 
+          ? `File exceeds ${maxMB}MB limit` 
+          : `Free users can upload up to ${maxMB}MB. Upgrade to Premium for larger files.`,
+        maxBytes,
+        upgrade: !hasPremium
+      });
     }
 
     const client = ensureR2();
@@ -1025,14 +1052,23 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
       monthlyCount = 0;
     }
     
+    // Calculate monthly warning thresholds for free users
+    const monthlyCap = limits.monthlyCap || 500;
+    const monthlyUsagePercent = monthlyCap ? Math.round((monthlyCount / monthlyCap) * 100) : 0;
+    const monthlyWarning = !hasPremium && monthlyUsagePercent >= 80;
+    const monthlyNearLimit = !hasPremium && monthlyUsagePercent >= 95;
+    
     const aiUsageInfo = {
       dailyCount,
       dailyCap: limits.dailyCap,
       dailyRemaining: Math.max(0, limits.dailyCap - dailyCount),
       monthlyCount,
-      monthlyCap: limits.monthlySoftCap,
-      monthlyRemaining: hasPremium ? 'unlimited' : Math.max(0, limits.monthlySoftCap - monthlyCount),
-      perMinuteLimit: limits.perMinute,
+      monthlyCap: hasPremium ? null : monthlyCap,
+      monthlyRemaining: hasPremium ? 'unlimited' : Math.max(0, monthlyCap - monthlyCount),
+      monthlyUsagePercent: hasPremium ? 0 : monthlyUsagePercent,
+      monthlyWarning,
+      monthlyNearLimit,
+      perMinuteLimit: limits.requestsPerMinute,
       totalRequests: aiUsage.totalRequests || 0,
       totalChatRequests: aiUsage.totalChatRequests || 0,
       totalReviewerRequests: aiUsage.totalReviewerRequests || 0

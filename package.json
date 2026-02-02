@@ -1,7 +1,7 @@
 {
   "name": "academiazen-backend",
-  "version": "1.0.0",
-  "description": "Push notification backend server for AcademiaZen PWA",
+  "version": "1.1.0",
+  "description": "AcademiaZen API Server - AI-powered study assistant",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
