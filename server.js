@@ -1838,6 +1838,28 @@ app.put('/api/state', requireAuth, async (req, res) => {
     }
     const user = await getOrCreateUser(req.user.uid, req.user.email);
     const sanitizedState = sanitizeStateForStorage(state);
+    
+    // PROTECTION: Prevent empty state from overwriting existing data
+    const existingState = user.state || {};
+    const existingHasData = (existingState.tasks?.length > 0) ||
+                           (existingState.subjects?.length > 0) ||
+                           (existingState.folders?.some(f => f.items?.length > 0)) ||
+                           (existingState.aiReviewers?.length > 0);
+    
+    const newHasData = (sanitizedState.tasks?.length > 0) ||
+                       (sanitizedState.subjects?.length > 0) ||
+                       (sanitizedState.folders?.some(f => f.items?.length > 0)) ||
+                       (sanitizedState.aiReviewers?.length > 0);
+    
+    // If existing state has real data but new state is empty, reject the save
+    if (existingHasData && !newHasData) {
+      console.warn(`[PROTECTED] Blocked empty state overwrite for user ${req.user.email}`);
+      return res.status(409).json({ 
+        error: 'Cannot overwrite existing data with empty state',
+        code: 'EMPTY_STATE_BLOCKED'
+      });
+    }
+    
     const stateBytes = Buffer.byteLength(JSON.stringify(sanitizedState), 'utf8');
     if (stateBytes > MAX_STATE_BYTES) {
       return res.status(413).json({ error: 'State payload too large' });
