@@ -1831,29 +1831,42 @@ app.get('/api/state', requireAuth, async (req, res) => {
 });
 
 app.put('/api/state', requireAuth, async (req, res) => {
+  console.log(`[SYNC] PUT /api/state from ${req.user.email}`);
   try {
     const { state } = req.body;
     if (!isValidState(state)) {
+      console.log(`[SYNC] Invalid state payload from ${req.user.email}`);
       return res.status(400).json({ error: 'Invalid state payload' });
     }
     const user = await getOrCreateUser(req.user.uid, req.user.email);
     const sanitizedState = sanitizeStateForStorage(state);
     
-    // PROTECTION: Prevent empty state from overwriting existing data
+    // Helper to check if state has meaningful data
+    const hasRealData = (s) => {
+      if (!s) return false;
+      // Check for tasks, subjects, folders with items, or reviewers
+      const hasContent = (s.tasks?.length > 0) ||
+                        (s.subjects?.length > 0) ||
+                        (s.folders?.some(f => f.items?.length > 0)) ||
+                        (s.aiReviewers?.length > 0);
+      // Also consider profile data as "real data" if user has customized it
+      const hasCustomProfile = s.profile?.firstName && s.profile.firstName !== 'Student';
+      return hasContent || hasCustomProfile;
+    };
+    
     const existingState = user.state || {};
-    const existingHasData = (existingState.tasks?.length > 0) ||
-                           (existingState.subjects?.length > 0) ||
-                           (existingState.folders?.some(f => f.items?.length > 0)) ||
-                           (existingState.aiReviewers?.length > 0);
+    const existingHasData = hasRealData(existingState);
+    const newHasData = hasRealData(sanitizedState);
     
-    const newHasData = (sanitizedState.tasks?.length > 0) ||
-                       (sanitizedState.subjects?.length > 0) ||
-                       (sanitizedState.folders?.some(f => f.items?.length > 0)) ||
-                       (sanitizedState.aiReviewers?.length > 0);
+    console.log(`[SYNC] State from ${req.user.email}: tasks=${sanitizedState.tasks?.length || 0}, subjects=${sanitizedState.subjects?.length || 0}, existingHasData=${existingHasData}, newHasData=${newHasData}`);
     
-    // If existing state has real data but new state is empty, reject the save
+    // PROTECTION: Only block if existing state has CONTENT data and new state has NONE
+    // This prevents accidental data loss from empty state overwrites
+    // But still allows profile-only updates
     if (existingHasData && !newHasData) {
       console.warn(`[PROTECTED] Blocked empty state overwrite for user ${req.user.email}`);
+      console.warn(`[PROTECTED] Existing: tasks=${existingState.tasks?.length || 0}, subjects=${existingState.subjects?.length || 0}`);
+      console.warn(`[PROTECTED] New: tasks=${sanitizedState.tasks?.length || 0}, subjects=${sanitizedState.subjects?.length || 0}`);
       return res.status(409).json({ 
         error: 'Cannot overwrite existing data with empty state',
         code: 'EMPTY_STATE_BLOCKED'
@@ -1867,6 +1880,7 @@ app.put('/api/state', requireAuth, async (req, res) => {
     user.state = sanitizedState;
     user.email = req.user.email || user.email;
     await user.save();
+    console.log(`[SYNC] Successfully saved state for ${req.user.email}`);
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to save state:', err);
