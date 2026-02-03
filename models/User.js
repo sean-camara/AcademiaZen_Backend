@@ -108,7 +108,8 @@ const AIChatMessageSchema = new mongoose.Schema({
 }, { _id: false });
 
 const UserProfileSchema = new mongoose.Schema({
-  name: { type: String, default: 'Student' },
+  firstName: { type: String, default: 'Student' },
+  lastName: { type: String, default: '' },
   university: { type: String, default: '' },
   semester: { type: String, default: '' },
   quoteEnabled: { type: Boolean, default: true },
@@ -207,7 +208,8 @@ function getDefaultState() {
     quizProgress: null,
     aiChat: [],
     profile: {
-      name: 'Student',
+      firstName: 'Student',
+      lastName: '',
       university: '',
       semester: '',
       quoteEnabled: true,

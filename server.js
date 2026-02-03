@@ -1801,6 +1801,28 @@ app.post('/api/billing/webhook/paymongo', async (req, res) => {
 app.get('/api/state', requireAuth, async (req, res) => {
   try {
     const user = await getOrCreateUser(req.user.uid, req.user.email);
+    
+    // Migrate old 'name' field to 'firstName' if needed
+    if (user.state?.profile) {
+      const profile = user.state.profile;
+      const legacyName = profile.name;
+      
+      // If old 'name' field exists and firstName is not set or is default 'Student'
+      if (legacyName && (!profile.firstName || profile.firstName === 'Student')) {
+        profile.firstName = legacyName;
+        delete profile.name;
+        
+        // Ensure lastName exists
+        if (!profile.lastName) {
+          profile.lastName = '';
+        }
+        
+        // Save the migrated data back to database
+        user.markModified('state.profile');
+        await user.save();
+      }
+    }
+    
     res.json({ state: user.state });
   } catch (err) {
     console.error('Failed to get state:', err);
@@ -2034,7 +2056,7 @@ function buildZenSystemPrompt(user, hasPremium) {
   const folders = user.state?.folders || [];
   
   // Get user's name
-  const userName = profile.name && profile.name !== 'Student' ? profile.name : null;
+  const userName = profile.firstName && profile.firstName !== 'Student' ? profile.firstName : null;
   const university = profile.university || null;
   
   // Get upcoming tasks (due in next 7 days)
