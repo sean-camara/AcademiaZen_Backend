@@ -1799,6 +1799,7 @@ app.post('/api/billing/webhook/paymongo', async (req, res) => {
 
 // --- Auth-protected ---
 app.get('/api/state', requireAuth, async (req, res) => {
+  console.log(`[SYNC] GET /api/state from ${req.user.email}`);
   try {
     const user = await getOrCreateUser(req.user.uid, req.user.email);
     
@@ -1823,6 +1824,7 @@ app.get('/api/state', requireAuth, async (req, res) => {
       }
     }
     
+    console.log(`[SYNC] Returning state for ${req.user.email}: tasks=${user.state?.tasks?.length || 0}, subjects=${user.state?.subjects?.length || 0}`);
     res.json({ state: user.state });
   } catch (err) {
     console.error('Failed to get state:', err);
