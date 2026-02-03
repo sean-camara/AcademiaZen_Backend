@@ -36,18 +36,17 @@ const AILogSchema = new mongoose.Schema({
   // User tier at time of request
   userTier: { type: String, enum: ['free', 'premium'], default: 'free' },
   
-  // Timestamp
-  createdAt: { type: Date, default: Date.now, index: true },
+  // Timestamp (index is created separately below with TTL)
+  createdAt: { type: Date, default: Date.now },
 }, { 
   timestamps: false, // We manage createdAt manually for indexing
-  // TTL: Auto-delete logs older than 90 days to save storage
-  expireAfterSeconds: 90 * 24 * 60 * 60,
 });
 
 // Compound indexes for common queries
 AILogSchema.index({ uid: 1, createdAt: -1 });
 AILogSchema.index({ uid: 1, endpoint: 1, createdAt: -1 });
-AILogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 90 * 24 * 60 * 60 }); // TTL index
+// TTL index: Auto-delete logs older than 90 days to save storage
+AILogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 90 * 24 * 60 * 60 });
 
 const AILog = mongoose.model('AILog', AILogSchema);
 
