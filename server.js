@@ -2318,6 +2318,227 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, aiUsageGuard, async (req, res) 
   }
 });
 
+// ========== SSE STREAMING CHAT ENDPOINT ==========
+// This endpoint streams responses token-by-token for a ChatGPT-like experience
+app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req, res) => {
+  const startTime = Date.now();
+  let logDetails = { userTier: req.zenTier || 'free', endpoint: 'chat-stream' };
+  
+  // Set up SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  res.flushHeaders();
+  
+  // Helper to send SSE events
+  const sendEvent = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  
+  try {
+    const { prompt, mode, history, contextInfo } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+      sendEvent('error', { message: 'Prompt is required' });
+      res.end();
+      return;
+    }
+    
+    const user = req.zenUser || await getOrCreateUser(req.user.uid, req.user.email);
+    const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    
+    if (!ALLOW_FREE_AI && !hasPremium) {
+      sendEvent('error', { message: 'Premium subscription required', code: 'PREMIUM_REQUIRED' });
+      res.end();
+      return;
+    }
+
+    const isDeep = mode === 'deep';
+    const maxPromptChars = hasPremium ? MAX_AI_PROMPT_CHARS : MAX_AI_PROMPT_CHARS_FREE;
+    
+    if (prompt.length > maxPromptChars) {
+      sendEvent('error', { message: 'Prompt is too long', code: 'PROMPT_TOO_LONG' });
+      res.end();
+      return;
+    }
+
+    logDetails.mode = isDeep ? 'deep' : 'fast';
+    logDetails.promptLength = prompt.length;
+
+    // Send analysis metadata event
+    sendEvent('meta', {
+      mode: isDeep ? 'deep' : 'fast',
+      model: hasPremium ? (isDeep ? 'deepseek-reasoner' : 'deepseek-chat') : 'openrouter-free',
+      contextInfo: contextInfo || null,
+      timestamp: new Date().toISOString()
+    });
+
+    const temperature = isDeep ? 0.3 : 0.6;
+    const systemPrompt = buildZenSystemPrompt(user, hasPremium);
+    const maxHistoryMessages = hasPremium ? 12 : 6;
+    const chatHistory = formatChatHistory(history, maxHistoryMessages);
+    
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...chatHistory,
+      { role: 'user', content: prompt }
+    ];
+
+    let fullText = '';
+    let totalTokens = 0;
+    
+    if (hasPremium) {
+      // Use DeepSeek streaming for premium users
+      const selectedModel = isDeep ? AI_MODEL_PREMIUM_DEEP : AI_MODEL_PREMIUM_FAST;
+      const maxTokens = isDeep ? AI_MAX_TOKENS_DEEP : AI_MAX_TOKENS_FAST;
+      
+      const response = await fetch(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${DEEPSEEK_REVIEWER_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: selectedModel,
+          max_tokens: Number.isFinite(maxTokens) ? maxTokens : 1200,
+          temperature,
+          messages,
+          stream: true,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData?.error?.message || 'DeepSeek API error');
+      }
+
+      // Process the stream
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta?.content;
+            if (delta) {
+              fullText += delta;
+              sendEvent('delta', { text: delta });
+            }
+            if (parsed.usage) {
+              totalTokens = parsed.usage.total_tokens || 0;
+            }
+          } catch (e) {
+            // Skip invalid JSON
+          }
+        }
+      }
+    } else {
+      // Use OpenRouter streaming for free users
+      const selectedModel = isDeep ? AI_MODEL_FREE_DEEP : AI_MODEL_FREE_FAST;
+      const maxTokens = isDeep ? AI_MAX_TOKENS_FREE_DEEP : AI_MAX_TOKENS_FREE_FAST;
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+      };
+      if (OPENROUTER_SITE_URL) headers['HTTP-Referer'] = OPENROUTER_SITE_URL;
+      if (OPENROUTER_APP_TITLE) headers['X-Title'] = OPENROUTER_APP_TITLE;
+
+      const response = await fetch(`${AI_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: selectedModel,
+          max_tokens: Number.isFinite(maxTokens) ? maxTokens : 800,
+          temperature,
+          messages,
+          stream: true,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData?.error?.message || 'OpenRouter API error');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta?.content;
+            if (delta) {
+              fullText += delta;
+              sendEvent('delta', { text: delta });
+            }
+            if (parsed.usage) {
+              totalTokens = parsed.usage.total_tokens || 0;
+            }
+          } catch (e) {
+            // Skip invalid JSON
+          }
+        }
+      }
+    }
+
+    // Send completion event
+    sendEvent('done', {
+      fullText,
+      totalTokens,
+      responseTimeMs: Date.now() - startTime
+    });
+
+    // Log successful request
+    logDetails.model = hasPremium ? (isDeep ? AI_MODEL_PREMIUM_DEEP : AI_MODEL_PREMIUM_FAST) : (isDeep ? AI_MODEL_FREE_DEEP : AI_MODEL_FREE_FAST);
+    logDetails.responseLength = fullText.length;
+    logDetails.responseTimeMs = Date.now() - startTime;
+    logDetails.totalTokens = totalTokens;
+    logDetails.success = true;
+    
+    logAIRequest(req.user.uid, 'chat-stream', logDetails);
+    incrementEndpointCounter(req.user.uid, 'chat');
+
+    res.end();
+  } catch (err) {
+    console.error('AI stream error:', err);
+    
+    logDetails.success = false;
+    logDetails.errorMessage = err?.message || 'Unknown error';
+    logDetails.responseTimeMs = Date.now() - startTime;
+    logAIRequest(req.user.uid, 'chat-stream', logDetails);
+    
+    sendEvent('error', { message: err?.message || 'AI request failed' });
+    res.end();
+  }
+});
+
 // ----- AI Reviewer Generation -----
 const MAX_AI_REVIEWERS = 10;
 const MAX_AI_REVIEWERS_FREE = 3; // Free users can only have 3 reviewers
