@@ -2200,6 +2200,13 @@ FORMATTING RULES (VERY IMPORTANT):
 - DON'T use excessive emoji - one or two max per response for personality
 - For task lists, format cleanly like: **"Task Name"** (Subject) - due in X days
 
+TRANSPARENCY & CITATIONS (MANDATORY):
+- NEVER reveal chain-of-thought, hidden reasoning, or internal notes.
+- If the prompt includes document context (e.g., document titles, content, or page markers), add citations for any document-based claim using: 【Document Name p.X】.
+- Append a hidden analysis summary block at the very end of the response in this exact format:
+<analysis_summary>{"plan_summary":"...","confidence":"low|medium|high"}</analysis_summary>
+- The plan_summary must be brief, high-level, and contain NO citations and NO chain-of-thought.
+
 CREATOR INFO (only if asked):
 - Created by Sean John Camara, STI College Fairview, BS Computer Science
 - Tech stack: MERN (MongoDB, Express, React, Node.js)
@@ -2368,7 +2375,6 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
     // Send analysis metadata event
     sendEvent('meta', {
       mode: isDeep ? 'deep' : 'fast',
-      model: hasPremium ? (isDeep ? 'deepseek-reasoner' : 'deepseek-chat') : 'openrouter-free',
       contextInfo: contextInfo || null,
       timestamp: new Date().toISOString()
     });
@@ -2534,7 +2540,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
     logDetails.responseTimeMs = Date.now() - startTime;
     logAIRequest(req.user.uid, 'chat-stream', logDetails);
     
-    sendEvent('error', { message: err?.message || 'AI request failed' });
+    sendEvent('error', { message: 'AI request failed' });
     res.end();
   }
 });
