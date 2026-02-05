@@ -1879,10 +1879,22 @@ app.put('/api/state', requireAuth, async (req, res) => {
     if (stateBytes > MAX_STATE_BYTES) {
       return res.status(413).json({ error: 'State payload too large' });
     }
-    user.state = sanitizedState;
-    user.email = req.user.email || user.email;
-    await user.save();
-    console.log(`[SYNC] Successfully saved state for ${req.user.email}`);
+    
+    // Use findOneAndUpdate with $set to ensure the state is saved
+    // This bypasses Mongoose's change detection which can be buggy with nested objects
+    const updateResult = await User.findOneAndUpdate(
+      { uid: req.user.uid },
+      { 
+        $set: { 
+          state: sanitizedState,
+          email: req.user.email || user.email
+        }
+      },
+      { new: true }
+    );
+    
+    console.log(`[SYNC] SAVED for ${req.user.email}: tasks=${updateResult?.state?.tasks?.length || 0}, subjects=${updateResult?.state?.subjects?.length || 0}`);
+    
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to save state:', err);
