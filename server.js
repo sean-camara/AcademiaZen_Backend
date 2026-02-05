@@ -3051,14 +3051,17 @@ async function checkTaskDeadlines() {
           timeText = `in ${daysUntilDue} days`;
         }
 
-        const dueDisplay = `${dueDate.toLocaleDateString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          year: 'numeric',
-        })} at ${dueDate.toLocaleTimeString('en-US', {
-          hour: 'numeric',
-          minute: '2-digit',
-        })}`;
+        // Format as ISO-like string but more readable
+        const month = dueDate.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
+        const day = dueDate.getUTCDate();
+        const year = dueDate.getUTCFullYear();
+        const hours = dueDate.getUTCHours();
+        const minutes = dueDate.getUTCMinutes();
+        const ampm = hours >= 12 ? 'PM' : 'AM';
+        const displayHours = hours % 12 || 12;
+        const displayMinutes = minutes.toString().padStart(2, '0');
+        
+        const dueDisplay = `${month} ${day}, ${year} at ${displayHours}:${displayMinutes} ${ampm}`;
         const subjectParam = task.subjectId ? `&subject=${encodeURIComponent(task.subjectId)}` : '';
         const payload = JSON.stringify({
           title: task.title,
