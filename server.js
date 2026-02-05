@@ -3051,17 +3051,34 @@ async function checkTaskDeadlines() {
           timeText = `in ${daysUntilDue} days`;
         }
 
-        // Format as ISO-like string but more readable
-        const month = dueDate.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
-        const day = dueDate.getUTCDate();
-        const year = dueDate.getUTCFullYear();
-        const hours = dueDate.getUTCHours();
-        const minutes = dueDate.getUTCMinutes();
-        const ampm = hours >= 12 ? 'PM' : 'AM';
-        const displayHours = hours % 12 || 12;
-        const displayMinutes = minutes.toString().padStart(2, '0');
+        // Format the date - if stored with timezone offset, extract the local time directly
+        // Date strings may be "2026-02-06T23:59:00+08:00" (with offset) or "2026-02-06T15:59:00.000Z" (UTC)
+        let displayHours, displayMinutes, month, day, year;
         
-        const dueDisplay = `${month} ${day}, ${year} at ${displayHours}:${displayMinutes} ${ampm}`;
+        const dateStr = task.dueDate;
+        // Check if date has timezone offset (not Z)
+        const tzMatch = dateStr.match(/(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+        if (tzMatch && !dateStr.endsWith('Z')) {
+          // Date has timezone offset - use the time as stored (user's local time)
+          year = parseInt(tzMatch[1]);
+          month = new Date(year, parseInt(tzMatch[2]) - 1, 1).toLocaleString('en-US', { month: 'short' });
+          day = parseInt(tzMatch[3]);
+          displayHours = parseInt(tzMatch[4]);
+          displayMinutes = parseInt(tzMatch[5]);
+        } else {
+          // Legacy UTC date - convert to... well, we don't know user's TZ, show UTC
+          month = dueDate.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
+          day = dueDate.getUTCDate();
+          year = dueDate.getUTCFullYear();
+          displayHours = dueDate.getUTCHours();
+          displayMinutes = dueDate.getUTCMinutes();
+        }
+        
+        const ampm = displayHours >= 12 ? 'PM' : 'AM';
+        const displayHours12 = displayHours % 12 || 12;
+        const displayMinutesStr = displayMinutes.toString().padStart(2, '0');
+        
+        const dueDisplay = `${month} ${day}, ${year} at ${displayHours12}:${displayMinutesStr} ${ampm}`;
         const subjectParam = task.subjectId ? `&subject=${encodeURIComponent(task.subjectId)}` : '';
         const payload = JSON.stringify({
           title: task.title,
