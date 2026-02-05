@@ -128,6 +128,7 @@ const AppSettingsSchema = new mongoose.Schema({
 const NotificationMetaSchema = new mongoose.Schema({
   lastDailyBriefingAt: { type: Date, default: null },
   lastStudyReminderAt: { type: Date, default: null },
+  pastDueNotifiedTasks: { type: [String], default: [] },
 }, { _id: false });
 
 const BillingSchema = new mongoose.Schema({

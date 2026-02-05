@@ -3019,17 +3019,72 @@ app.post('/api/ai/generate-reviewer', requireAuth, reviewerLimiter, aiUsageGuard
 async function checkTaskDeadlines() {
   const now = new Date();
   const threeDaysFromNow = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+  const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
   try {
     const users = await User.find({
       'state.settings.notifications': true,
       'state.settings.deadlineAlerts': true,
-    }, { uid: 1, 'state.tasks': 1 }).lean();
+    }, { uid: 1, 'state.tasks': 1, 'notificationMeta': 1 }).lean();
 
     for (const user of users) {
       const tasks = (user.state?.tasks || []).filter(t => t && !t.completed && t.dueDate);
+      const pastDueNotified = user.notificationMeta?.pastDueNotifiedTasks || [];
+      
       for (const task of tasks) {
         const dueDate = new Date(task.dueDate);
+        
+        // Check for past due tasks (within last 24 hours to avoid spamming old tasks)
+        if (dueDate < now && dueDate >= oneDayAgo) {
+          // Only notify once per past due task
+          if (pastDueNotified.includes(task.id)) continue;
+          
+          // Format the date for display
+          let displayHours, displayMinutes, month, day, year;
+          const dateStr = task.dueDate;
+          const tzMatch = dateStr.match(/(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+          if (tzMatch && !dateStr.endsWith('Z')) {
+            year = parseInt(tzMatch[1]);
+            month = new Date(year, parseInt(tzMatch[2]) - 1, 1).toLocaleString('en-US', { month: 'short' });
+            day = parseInt(tzMatch[3]);
+            displayHours = parseInt(tzMatch[4]);
+            displayMinutes = parseInt(tzMatch[5]);
+          } else {
+            const manilaTime = new Date(dueDate.toLocaleString('en-US', { timeZone: 'Asia/Manila' }));
+            month = manilaTime.toLocaleString('en-US', { month: 'short' });
+            day = manilaTime.getDate();
+            year = manilaTime.getFullYear();
+            displayHours = manilaTime.getHours();
+            displayMinutes = manilaTime.getMinutes();
+          }
+          
+          const ampm = displayHours >= 12 ? 'PM' : 'AM';
+          const displayHours12 = displayHours % 12 || 12;
+          const displayMinutesStr = displayMinutes.toString().padStart(2, '0');
+          const dueDisplay = `${month} ${day}, ${year} at ${displayHours12}:${displayMinutesStr} ${ampm}`;
+          
+          const subjectParam = task.subjectId ? `&subject=${encodeURIComponent(task.subjectId)}` : '';
+          const payload = JSON.stringify({
+            title: `🚨 Past Due: ${task.title}`,
+            body: `Was due on ${dueDisplay}. Mark it complete or reschedule!`,
+            icon: '/icons/icon-192x192.svg',
+            badge: '/icons/icon-72x72.svg',
+            url: `/?page=home${subjectParam}`,
+            tag: `past-due-${task.id}`,
+            data: { taskId: task.id, subjectId: task.subjectId, type: 'past_due' },
+          });
+
+          await sendNotificationToUser(user.uid, payload);
+          
+          // Mark this task as notified for past due
+          await User.updateOne(
+            { uid: user.uid },
+            { $addToSet: { 'notificationMeta.pastDueNotifiedTasks': task.id } }
+          );
+          continue;
+        }
+        
+        // Skip tasks that are past due (more than 24 hours) or too far in the future
         if (dueDate <= now || dueDate > threeDaysFromNow) continue;
 
         const hoursUntilDue = Math.round((dueDate - now) / (1000 * 60 * 60));
@@ -3093,6 +3148,16 @@ async function checkTaskDeadlines() {
         });
 
         await sendNotificationToUser(user.uid, payload);
+      }
+      
+      // Cleanup: remove task IDs from pastDueNotifiedTasks if tasks are completed or deleted
+      const allTaskIds = (user.state?.tasks || []).filter(t => t && !t.completed).map(t => t.id);
+      const staleTaskIds = pastDueNotified.filter(id => !allTaskIds.includes(id));
+      if (staleTaskIds.length > 0) {
+        await User.updateOne(
+          { uid: user.uid },
+          { $pull: { 'notificationMeta.pastDueNotifiedTasks': { $in: staleTaskIds } } }
+        );
       }
     }
   } catch (err) {
