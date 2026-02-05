@@ -3066,12 +3066,14 @@ async function checkTaskDeadlines() {
           displayHours = parseInt(tzMatch[4]);
           displayMinutes = parseInt(tzMatch[5]);
         } else {
-          // Legacy UTC date - convert to... well, we don't know user's TZ, show UTC
-          month = dueDate.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
-          day = dueDate.getUTCDate();
-          year = dueDate.getUTCFullYear();
-          displayHours = dueDate.getUTCHours();
-          displayMinutes = dueDate.getUTCMinutes();
+          // Legacy UTC date - convert to Asia/Manila timezone (UTC+8)
+          // This handles old tasks that were stored before the timezone fix
+          const manilaTime = new Date(dueDate.toLocaleString('en-US', { timeZone: 'Asia/Manila' }));
+          month = manilaTime.toLocaleString('en-US', { month: 'short' });
+          day = manilaTime.getDate();
+          year = manilaTime.getFullYear();
+          displayHours = manilaTime.getHours();
+          displayMinutes = manilaTime.getMinutes();
         }
         
         const ampm = displayHours >= 12 ? 'PM' : 'AM';
