@@ -3065,8 +3065,8 @@ async function checkTaskDeadlines() {
           
           const subjectParam = task.subjectId ? `&subject=${encodeURIComponent(task.subjectId)}` : '';
           const payload = JSON.stringify({
-            title: `🚨 Past Due: ${task.title}`,
-            body: `Was due on ${dueDisplay}. Mark it complete or reschedule!`,
+            title: task.title,
+            body: `Was due on ${dueDisplay}. Mark it complete`,
             icon: '/icons/icon-192x192.svg',
             badge: '/icons/icon-72x72.svg',
             url: `/?page=home${subjectParam}`,
