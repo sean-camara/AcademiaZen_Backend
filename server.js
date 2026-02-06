@@ -941,7 +941,7 @@ const ALLOWED_MIME_TYPES = ['application/pdf'];
 
 app.post('/api/uploads/presign', requireAuth, async (req, res) => {
   try {
-    const { filename, contentType, size } = req.body || {};
+    const { filename, contentType, size, compressed } = req.body || {};
     if (!filename || !contentType || !size) {
       return res.status(400).json({ error: 'filename, contentType, and size are required' });
     }
@@ -985,12 +985,18 @@ app.post('/api/uploads/presign', requireAuth, async (req, res) => {
       .slice(-120);
     const key = `${req.user.uid}/${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${safeName}`;
 
-    const command = new PutObjectCommand({
+    const putParams = {
       Bucket: R2_BUCKET,
       Key: key,
       ContentType: contentType,
       ContentLength: sizeNum,
-    });
+    };
+    // If client sent compressed data, set Content-Encoding so R2 stores it properly
+    if (compressed) {
+      putParams.ContentEncoding = 'gzip';
+    }
+
+    const command = new PutObjectCommand(putParams);
     const uploadUrl = await getSignedUrl(client, command, { expiresIn: R2_SIGNED_URL_TTL });
     const publicUrl = R2_PUBLIC_BASE_URL ? `${R2_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key}` : '';
     res.json({ key, uploadUrl, publicUrl });
