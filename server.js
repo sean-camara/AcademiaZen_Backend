@@ -77,8 +77,9 @@ const AI_LIMITS = {
   premium: {
     requestsPerMinute: 15,     // Max 15 requests per minute
     dailyCap: 30,              // Max 30 requests per day
-    monthlyCap: 200,           // Max 200 requests per month
-    deepDailyCap: 8,           // Max 8 deep reasoning requests per day
+    monthlyCap: 300,           // Max 300 requests per month
+    deepDailyCap: 10,          // Max 10 deep reasoning requests per day
+    deepMonthlyCap: 40,        // Max 40 deep reasoning requests per month
   },
 };
 
@@ -213,7 +214,7 @@ async function aiUsageGuard(req, res, next) {
     }
 
     // Check deep reasoning daily cap
-    const isDeepRequest = req.body?.mode === 'deep';
+    const isDeepRequest = req.body?.mode === 'deep' && !req.body?.forceFreeModel;
     if (isDeepRequest && limits.deepDailyCap) {
       if (user.aiUsage.deepDailyResetDate !== todayStr) {
         user.aiUsage.deepDailyCount = 0;
@@ -226,6 +227,23 @@ async function aiUsageGuard(req, res, next) {
           upgrade: !hasPremium,
         });
       }
+
+      // Check deep reasoning monthly cap
+      if (limits.deepMonthlyCap) {
+        if (user.aiUsage.deepMonthlyResetDate !== monthStr) {
+          user.aiUsage.deepMonthlyCount = 0;
+          user.aiUsage.deepMonthlyResetDate = monthStr;
+        }
+        if (user.aiUsage.deepMonthlyCount >= limits.deepMonthlyCap) {
+          return res.status(429).json({
+            error: 'deep_monthly_quota_exceeded',
+            message: `Deep reasoning monthly limit of ${limits.deepMonthlyCap} reached. Use Fast mode or try free model.`,
+            upgrade: !hasPremium,
+          });
+        }
+        user.aiUsage.deepMonthlyCount = (user.aiUsage.deepMonthlyCount || 0) + 1;
+      }
+
       user.aiUsage.deepDailyCount = (user.aiUsage.deepDailyCount || 0) + 1;
     }
 
@@ -528,7 +546,7 @@ const AI_MODEL_FREE_DEEP = process.env.AI_MODEL_FREE_DEEP || AI_MODEL_DEEP;
 const AI_MODEL_PREMIUM_FAST = process.env.AI_MODEL_PREMIUM_FAST || 'deepseek-chat';
 const AI_MODEL_PREMIUM_DEEP = process.env.AI_MODEL_PREMIUM_DEEP || 'deepseek-reasoner';
 const AI_MAX_TOKENS_FAST = Number(process.env.AI_MAX_TOKENS_FAST || 4096);
-const AI_MAX_TOKENS_DEEP = Number(process.env.AI_MAX_TOKENS_DEEP || 8192);
+const AI_MAX_TOKENS_DEEP = Number(process.env.AI_MAX_TOKENS_DEEP || 4096);
 const AI_MAX_TOKENS_FREE_FAST = Number(process.env.AI_MAX_TOKENS_FREE_FAST || 1600);
 const AI_MAX_TOKENS_FREE_DEEP = Number(process.env.AI_MAX_TOKENS_FREE_DEEP || 3200);
 const OPENROUTER_API_KEY = resolveEnvRef(process.env.OPENROUTER_API_KEY || process.env.DEEPSEEK_API_KEY);
@@ -582,14 +600,14 @@ function isOwnedKey(key, uid) {
 const BILLING_PLANS = {
   premium: {
     weekly: {
-      amount: 4900,
+      amount: 14900,
       currency: 'PHP',
       label: 'Premium Weekly',
       description: 'AcademiaZen Premium (Weekly)',
       interval: 'weekly',
     },
     monthly: {
-      amount: 12900,
+      amount: 50000,
       currency: 'PHP',
       label: 'Premium Monthly',
       description: 'AcademiaZen Premium (Monthly)',
@@ -809,6 +827,13 @@ function applyPaidSubscription(user, interval, details = {}) {
   if (details.sourceId) user.billing.paymongo.sourceId = details.sourceId;
   if (details.eventId) user.billing.paymongo.lastEventId = details.eventId;
   if (details.eventType) user.billing.paymongo.lastEventType = details.eventType;
+
+  // Reset AI usage counters on subscription activation/renewal
+  if (!user.aiUsage) user.aiUsage = {};
+  user.aiUsage.dailyCount = 0;
+  user.aiUsage.monthlyCount = 0;
+  user.aiUsage.deepDailyCount = 0;
+  user.aiUsage.deepMonthlyCount = 0;
 }
 
 function buildPaymongoAuthHeader() {
@@ -1144,6 +1169,13 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
     if (aiUsage.deepDailyResetDate !== today) {
       deepDailyCount = 0;
     }
+
+    // Deep reasoning monthly usage
+    let deepMonthlyCount = aiUsage.deepMonthlyCount || 0;
+    if (aiUsage.deepMonthlyResetDate !== currentMonth) {
+      deepMonthlyCount = 0;
+    }
+    const deepMonthlyCap = limits.deepMonthlyCap || null;
     
     const aiUsageInfo = {
       dailyCount,
@@ -1156,8 +1188,11 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
       monthlyWarning,
       monthlyNearLimit,
       deepDailyCount,
-      deepDailyCap: limits.deepDailyCap || 8,
-      deepDailyRemaining: Math.max(0, (limits.deepDailyCap || 8) - deepDailyCount),
+      deepDailyCap: limits.deepDailyCap || 10,
+      deepDailyRemaining: Math.max(0, (limits.deepDailyCap || 10) - deepDailyCount),
+      deepMonthlyCount,
+      deepMonthlyCap,
+      deepMonthlyRemaining: deepMonthlyCap ? Math.max(0, deepMonthlyCap - deepMonthlyCount) : null,
       perMinuteLimit: limits.requestsPerMinute,
       totalRequests: aiUsage.totalRequests || 0,
       totalChatRequests: aiUsage.totalChatRequests || 0,
@@ -2313,6 +2348,10 @@ CREATOR INFO (only if asked):
 - Created by Sean John Camara, STI College Fairview, BS Computer Science
 - Tech stack: MERN (MongoDB, Express, React, Node.js)
 
+RESPONSE LENGTH AWARENESS:
+- You have a token limit on responses. If your answer is getting long and might be cut off, end with a clear stopping point and add:\n---\nShall I continue?
+- This lets the student request the rest rather than getting an incomplete response.
+
 ${tierNote}
 ${userContext}`;
 }
@@ -2348,7 +2387,7 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, aiUsageGuard, async (req, res) 
   let logDetails = { userTier: req.zenTier || 'free', endpoint: 'chat' };
   
   try {
-    const { prompt, mode, history } = req.body;
+    const { prompt, mode, history, forceFreeModel } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required' });
     }
@@ -2356,6 +2395,7 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, aiUsageGuard, async (req, res) 
     // Use cached user from guard if available
     const user = req.zenUser || await getOrCreateUser(req.user.uid, req.user.email);
     const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    const useFreeModel = forceFreeModel === true;
     if (!ALLOW_FREE_AI && !hasPremium) {
       return res.status(402).json({ error: 'Premium subscription required' });
     }
@@ -2386,7 +2426,7 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, aiUsageGuard, async (req, res) 
     ];
 
     let data;
-    if (hasPremium) {
+    if (hasPremium && !useFreeModel) {
       const selectedModel = isDeep ? AI_MODEL_PREMIUM_DEEP : AI_MODEL_PREMIUM_FAST;
       const maxTokens = isDeep ? AI_MAX_TOKENS_DEEP : AI_MAX_TOKENS_FAST;
       data = await deepseekChatRequest(
@@ -2459,7 +2499,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
   };
   
   try {
-    const { prompt, mode, history, contextInfo } = req.body;
+    const { prompt, mode, history, contextInfo, forceFreeModel } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       sendEvent('error', { message: 'Prompt is required' });
       res.end();
@@ -2468,6 +2508,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
     
     const user = req.zenUser || await getOrCreateUser(req.user.uid, req.user.email);
     const hasPremium = user.billing?.plan === 'premium' && isBillingActive(user.billing);
+    const useFreeModel = forceFreeModel === true;
     
     if (!ALLOW_FREE_AI && !hasPremium) {
       sendEvent('error', { message: 'Premium subscription required', code: 'PREMIUM_REQUIRED' });
@@ -2508,7 +2549,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
     let fullText = '';
     let totalTokens = 0;
     
-    if (hasPremium) {
+    if (hasPremium && !useFreeModel) {
       // Use DeepSeek streaming for premium users
       const selectedModel = isDeep ? AI_MODEL_PREMIUM_DEEP : AI_MODEL_PREMIUM_FAST;
       const maxTokens = isDeep ? AI_MAX_TOKENS_DEEP : AI_MAX_TOKENS_FAST;
