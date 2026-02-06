@@ -2450,6 +2450,10 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
 
           try {
             const parsed = JSON.parse(data);
+            const reasoning = parsed.choices?.[0]?.delta?.reasoning_content;
+            if (reasoning) {
+              sendEvent('thinking', { text: reasoning });
+            }
             const delta = parsed.choices?.[0]?.delta?.content;
             if (delta) {
               fullText += delta;
@@ -2511,6 +2515,10 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
 
           try {
             const parsed = JSON.parse(data);
+            const reasoning = parsed.choices?.[0]?.delta?.reasoning_content;
+            if (reasoning) {
+              sendEvent('thinking', { text: reasoning });
+            }
             const delta = parsed.choices?.[0]?.delta?.content;
             if (delta) {
               fullText += delta;
