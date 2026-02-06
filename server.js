@@ -1098,10 +1098,10 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
     let dailyCount = aiUsage.dailyCount || 0;
     let monthlyCount = aiUsage.monthlyCount || 0;
     
-    if (aiUsage.lastResetDate !== today) {
+    if (aiUsage.dailyResetDate !== today) {
       dailyCount = 0;
     }
-    if (aiUsage.lastResetMonth !== currentMonth) {
+    if (aiUsage.monthlyResetDate !== currentMonth) {
       monthlyCount = 0;
     }
     
