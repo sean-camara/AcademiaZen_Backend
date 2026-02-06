@@ -169,6 +169,11 @@ const AIUsageSchema = new mongoose.Schema({
   requestsThisMinute: { type: Number, default: 0 },
   minuteResetAt: { type: Date, default: null },
   
+  // Free-tier cooldown (12-hour window)
+  cooldownUntil: { type: Date, default: null },
+  windowCount: { type: Number, default: 0 },
+  windowStartedAt: { type: Date, default: null },
+  
   // Lifetime stats
   totalRequests: { type: Number, default: 0 },
   totalChatRequests: { type: Number, default: 0 },

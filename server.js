@@ -62,11 +62,16 @@ const reviewerLimiter = rateLimit({
 });
 
 // ========== AI USAGE LIMITS (Per-User Quota System) ==========
+const FREE_COOLDOWN_HOURS = Number(process.env.FREE_COOLDOWN_HOURS || 12);
+const FREE_COOLDOWN_MESSAGES = Number(process.env.FREE_COOLDOWN_MESSAGES || 5);
+
 const AI_LIMITS = {
   free: {
     requestsPerMinute: 5,      // Max 5 requests per minute
-    dailyCap: 30,              // Max 30 requests per day
+    dailyCap: 200,             // Effectively unlimited within cooldown logic
     monthlyCap: 500,           // Soft cap for analytics
+    cooldownHours: FREE_COOLDOWN_HOURS,   // 12-hour cooldown after messages used
+    cooldownMessages: FREE_COOLDOWN_MESSAGES, // 5 messages per window
   },
   premium: {
     requestsPerMinute: 15,     // Max 15 requests per minute
@@ -134,17 +139,65 @@ async function aiUsageGuard(req, res, next) {
       user.aiUsage.minuteResetAt = new Date(now.getTime() + 60 * 1000);
     }
 
-    // Check daily cap
-    if (user.aiUsage.dailyCount >= limits.dailyCap) {
+    // Free-tier cooldown enforcement (12h window with limited messages)
+    if (!hasPremium && limits.cooldownHours && limits.cooldownMessages) {
+      // Check if user is currently in cooldown
+      if (user.aiUsage.cooldownUntil && new Date(user.aiUsage.cooldownUntil) > now) {
+        const cooldownEnd = new Date(user.aiUsage.cooldownUntil);
+        const remainingMs = cooldownEnd.getTime() - now.getTime();
+        const remainingHours = Math.floor(remainingMs / (1000 * 60 * 60));
+        const remainingMinutes = Math.ceil((remainingMs % (1000 * 60 * 60)) / (1000 * 60));
+        return res.status(429).json({
+          error: 'free_cooldown',
+          message: `You've used your ${limits.cooldownMessages} free messages. Upgrade to Premium for unlimited access, or wait ${remainingHours}h ${remainingMinutes}m.`,
+          cooldownUntil: cooldownEnd.toISOString(),
+          remainingMs,
+          upgrade: true,
+        });
+      }
+
+      // If cooldown has expired, reset the window
+      if (user.aiUsage.cooldownUntil && new Date(user.aiUsage.cooldownUntil) <= now) {
+        user.aiUsage.cooldownUntil = null;
+        user.aiUsage.windowCount = 0;
+        user.aiUsage.windowStartedAt = null;
+      }
+
+      // Start a new window if none active
+      if (!user.aiUsage.windowStartedAt) {
+        user.aiUsage.windowStartedAt = now;
+        user.aiUsage.windowCount = 0;
+      }
+
+      // Check if this message would exceed the window limit
+      if (user.aiUsage.windowCount >= limits.cooldownMessages) {
+        // Activate cooldown
+        const cooldownEnd = new Date(now.getTime() + limits.cooldownHours * 60 * 60 * 1000);
+        user.aiUsage.cooldownUntil = cooldownEnd;
+        await user.save();
+        const remainingHours = limits.cooldownHours;
+        return res.status(429).json({
+          error: 'free_cooldown',
+          message: `You've used your ${limits.cooldownMessages} free messages. Upgrade to Premium for unlimited access, or wait ${remainingHours} hours.`,
+          cooldownUntil: cooldownEnd.toISOString(),
+          remainingMs: limits.cooldownHours * 60 * 60 * 1000,
+          upgrade: true,
+        });
+      }
+
+      // Increment window count
+      user.aiUsage.windowCount = (user.aiUsage.windowCount || 0) + 1;
+    }
+
+    // Check daily cap (premium users only — free users use cooldown system)
+    if (hasPremium && user.aiUsage.dailyCount >= limits.dailyCap) {
       const resetTime = new Date(todayStr + 'T00:00:00Z');
       resetTime.setDate(resetTime.getDate() + 1);
       return res.status(429).json({
         error: 'daily_quota_exceeded',
-        message: hasPremium 
-          ? 'Daily AI limit reached. Resets at midnight UTC.'
-          : 'Daily AI limit reached. Upgrade to Premium for more requests.',
+        message: 'Daily AI limit reached. Resets at midnight UTC.',
         resetAt: resetTime.toISOString(),
-        upgrade: !hasPremium,
+        upgrade: false,
       });
     }
 
