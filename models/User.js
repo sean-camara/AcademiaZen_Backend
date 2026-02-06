@@ -133,7 +133,7 @@ const NotificationMetaSchema = new mongoose.Schema({
 
 const BillingSchema = new mongoose.Schema({
   plan: { type: String, enum: ['free', 'premium'], default: 'free' },
-  interval: { type: String, enum: ['none', 'monthly', 'yearly'], default: 'none' },
+  interval: { type: String, enum: ['none', 'weekly', 'monthly', 'yearly'], default: 'none' },
   status: { type: String, enum: ['free', 'pending', 'active', 'canceled', 'expired', 'past_due'], default: 'free' },
   currentPeriodEnd: { type: Date, default: null },
   autoRenew: { type: Boolean, default: true },
