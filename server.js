@@ -68,15 +68,17 @@ const FREE_COOLDOWN_MESSAGES = Number(process.env.FREE_COOLDOWN_MESSAGES || 5);
 const AI_LIMITS = {
   free: {
     requestsPerMinute: 5,      // Max 5 requests per minute
-    dailyCap: 200,             // Effectively unlimited within cooldown logic
+    dailyCap: 30,              // Soft daily cap (cooldown is primary gate)
     monthlyCap: 500,           // Soft cap for analytics
+    deepDailyCap: 5,           // Max 5 deep reasoning requests per day
     cooldownHours: FREE_COOLDOWN_HOURS,   // 12-hour cooldown after messages used
     cooldownMessages: FREE_COOLDOWN_MESSAGES, // 5 messages per window
   },
   premium: {
     requestsPerMinute: 15,     // Max 15 requests per minute
-    dailyCap: 200,             // Max 200 requests per day
-    monthlyCap: null,          // Unlimited
+    dailyCap: 30,              // Max 30 requests per day
+    monthlyCap: 200,           // Max 200 requests per month
+    deepDailyCap: 8,           // Max 8 deep reasoning requests per day
   },
 };
 
@@ -189,16 +191,42 @@ async function aiUsageGuard(req, res, next) {
       user.aiUsage.windowCount = (user.aiUsage.windowCount || 0) + 1;
     }
 
-    // Check daily cap (premium users only — free users use cooldown system)
-    if (hasPremium && user.aiUsage.dailyCount >= limits.dailyCap) {
+    // Check daily cap (applies to all users)
+    if (user.aiUsage.dailyCount >= limits.dailyCap) {
       const resetTime = new Date(todayStr + 'T00:00:00Z');
       resetTime.setDate(resetTime.getDate() + 1);
       return res.status(429).json({
         error: 'daily_quota_exceeded',
-        message: 'Daily AI limit reached. Resets at midnight UTC.',
+        message: 'Daily AI limit reached. Resets at midnight.',
         resetAt: resetTime.toISOString(),
-        upgrade: false,
+        upgrade: !hasPremium,
       });
+    }
+
+    // Check monthly cap
+    if (limits.monthlyCap && user.aiUsage.monthlyCount >= limits.monthlyCap) {
+      return res.status(429).json({
+        error: 'monthly_quota_exceeded',
+        message: `Monthly AI limit of ${limits.monthlyCap} requests reached. Resets next month.`,
+        upgrade: !hasPremium,
+      });
+    }
+
+    // Check deep reasoning daily cap
+    const isDeepRequest = req.body?.mode === 'deep';
+    if (isDeepRequest && limits.deepDailyCap) {
+      if (user.aiUsage.deepDailyResetDate !== todayStr) {
+        user.aiUsage.deepDailyCount = 0;
+        user.aiUsage.deepDailyResetDate = todayStr;
+      }
+      if (user.aiUsage.deepDailyCount >= limits.deepDailyCap) {
+        return res.status(429).json({
+          error: 'deep_quota_exceeded',
+          message: `Deep reasoning limit of ${limits.deepDailyCap}/day reached. Use Fast mode or wait until tomorrow.`,
+          upgrade: !hasPremium,
+        });
+      }
+      user.aiUsage.deepDailyCount = (user.aiUsage.deepDailyCount || 0) + 1;
     }
 
     // Increment counters (will be saved after successful request)
@@ -1105,22 +1133,31 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
       monthlyCount = 0;
     }
     
-    // Calculate monthly warning thresholds for free users
+    // Calculate monthly warning thresholds (for all users now)
     const monthlyCap = limits.monthlyCap || 500;
     const monthlyUsagePercent = monthlyCap ? Math.round((monthlyCount / monthlyCap) * 100) : 0;
-    const monthlyWarning = !hasPremium && monthlyUsagePercent >= 80;
-    const monthlyNearLimit = !hasPremium && monthlyUsagePercent >= 95;
+    const monthlyWarning = monthlyUsagePercent >= 80;
+    const monthlyNearLimit = monthlyUsagePercent >= 95;
+
+    // Deep reasoning daily usage
+    let deepDailyCount = aiUsage.deepDailyCount || 0;
+    if (aiUsage.deepDailyResetDate !== today) {
+      deepDailyCount = 0;
+    }
     
     const aiUsageInfo = {
       dailyCount,
       dailyCap: limits.dailyCap,
       dailyRemaining: Math.max(0, limits.dailyCap - dailyCount),
       monthlyCount,
-      monthlyCap: hasPremium ? null : monthlyCap,
-      monthlyRemaining: hasPremium ? 'unlimited' : Math.max(0, monthlyCap - monthlyCount),
-      monthlyUsagePercent: hasPremium ? 0 : monthlyUsagePercent,
+      monthlyCap,
+      monthlyRemaining: Math.max(0, monthlyCap - monthlyCount),
+      monthlyUsagePercent,
       monthlyWarning,
       monthlyNearLimit,
+      deepDailyCount,
+      deepDailyCap: limits.deepDailyCap || 8,
+      deepDailyRemaining: Math.max(0, (limits.deepDailyCap || 8) - deepDailyCount),
       perMinuteLimit: limits.requestsPerMinute,
       totalRequests: aiUsage.totalRequests || 0,
       totalChatRequests: aiUsage.totalChatRequests || 0,
