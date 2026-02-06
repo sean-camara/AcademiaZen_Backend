@@ -2287,10 +2287,23 @@ function formatChatHistory(history, maxMessages = 10) {
   // Take last N messages for context
   const recent = history.slice(-maxMessages);
   
-  return recent.map(msg => ({
-    role: msg.role === 'ai' ? 'assistant' : 'user',
-    content: msg.text || ''
-  })).filter(m => m.content.trim());
+  // Smart truncation: keep the last 2 messages (1 user + 1 assistant) intact
+  // for conversational continuity. Truncate older messages to save context space.
+  const MAX_CHARS_OLDER = 1500; // Older messages get truncated
+  const KEEP_INTACT = 2;        // Last 2 messages stay full
+  
+  return recent.map((msg, idx) => {
+    const role = msg.role === 'ai' ? 'assistant' : 'user';
+    let content = msg.text || '';
+    
+    // Truncate older messages (not the last KEEP_INTACT)
+    const isRecent = idx >= recent.length - KEEP_INTACT;
+    if (!isRecent && content.length > MAX_CHARS_OLDER) {
+      content = content.slice(0, MAX_CHARS_OLDER) + '... [truncated for context — full response was provided earlier]';
+    }
+    
+    return { role, content };
+  }).filter(m => m.content.trim());
 }
 
 app.post('/api/ai/chat', requireAuth, aiLimiter, aiUsageGuard, async (req, res) => {
