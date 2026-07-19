@@ -600,8 +600,8 @@ const PAYMONGO_WEBHOOK_TOLERANCE_SECONDS = Number(process.env.PAYMONGO_WEBHOOK_T
 
 const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
 const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
-const MAX_AI_PROMPT_CHARS = Number(process.env.MAX_AI_PROMPT_CHARS || 12000);
-const MAX_AI_PROMPT_CHARS_FREE = Number(process.env.MAX_AI_PROMPT_CHARS_FREE || 3000);
+const MAX_AI_PROMPT_CHARS = Number(process.env.MAX_AI_PROMPT_CHARS || 30000);
+const MAX_AI_PROMPT_CHARS_FREE = Number(process.env.MAX_AI_PROMPT_CHARS_FREE || 15000);
 const AI_BASE_URL = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
 const AI_MODEL_DEFAULT = process.env.AI_MODEL || 'deepseek/deepseek-v4-flash';
 const AI_MODEL_FAST = process.env.AI_MODEL_FAST || 'deepseek/deepseek-v4-flash';
