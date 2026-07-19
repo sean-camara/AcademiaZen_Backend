@@ -1,4 +1,4 @@
-const { validateProductionEnvironment, assertProductionEnvironment } = require('../services/envValidation');
+const { validateProductionEnvironment, assertProductionEnvironment } = require('../dist/services/envValidation');
 
 const valid = {
   NODE_ENV: 'production',

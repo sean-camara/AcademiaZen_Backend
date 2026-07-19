@@ -12,7 +12,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const mongoose = require('mongoose');
 const webpush = require('web-push');
 const crypto = require('crypto');
@@ -98,7 +98,7 @@ const reviewerLimiter = rateLimit({
   limit: 10, // Max 10 reviewer generations per hour per user
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.uid || req.ip, // Rate limit by user ID
+  keyGenerator: (req) => req.user?.uid || ipKeyGenerator(req.ip), // Rate limit by user ID or normalized IP
   message: { error: 'Too many reviewer requests. Please wait before creating more reviewers.' },
 });
 

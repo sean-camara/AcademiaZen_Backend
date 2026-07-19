@@ -3,7 +3,7 @@ const {
   applyPaidSubscription,
   getBillingSnapshot,
   getPaymentKey,
-} = require('../services/billing');
+} = require('../dist/services/billing');
 
 function makeUser() {
   return {

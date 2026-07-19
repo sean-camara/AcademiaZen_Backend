@@ -2,7 +2,7 @@
 
 ## Observed architecture (2026-07-19)
 
-The API is Express 4/CommonJS on Node, with 29 route handlers and most behavior in a 3,444-line `server.js`. Firebase Admin authenticates bearer tokens. Mongoose stores one embedded user/state aggregate plus separate focus sessions, push subscriptions, and expiring AI logs. External adapters are inline for OpenRouter/DeepSeek, PayMongo, R2, and Web Push. Background notification scans run in-process with timers.
+The audited baseline was Express 4/CommonJS on Node, with 29 route handlers and most behavior in a 3,444-line `server.js`. The modernization branch now uses Express 5 and a strict TypeScript 7 build pipeline while the compatibility entrypoint remains JavaScript. Firebase Admin authenticates bearer tokens. Mongoose stores one embedded user/state aggregate plus separate focus sessions, push subscriptions, and expiring AI logs. External adapters are still largely inline for OpenRouter/DeepSeek, PayMongo, R2, and Web Push. Background notification scans run in-process with timers.
 
 ```text
 Host Nginx/TLS
@@ -39,3 +39,7 @@ src/shared/{errors,contracts,types,security}/
 - Convert vertical modules to strict native-ESM TypeScript, leaving compatibility entrypoints only while needed.
 - Keep the embedded `state` document initially; add revision conflict control before considering collection decomposition.
 - Add liveness (process) and readiness (Mongo/providers required for core API) separately.
+
+## Migration status
+
+`services/billing.ts`, `services/accountDeletion.ts`, and `services/envValidation.ts` are strict TypeScript modules compiled with `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`. The compiler also emits the legacy CommonJS graph into `dist/`, so the production command runs `node dist/server.js` and old module behavior is retained. New modules must be TypeScript; existing route groups move only with characterization tests. The JavaScript compatibility entrypoint and remaining god-file size are explicit release limitations, not hidden completion claims.

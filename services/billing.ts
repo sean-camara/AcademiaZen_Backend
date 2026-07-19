@@ -1,6 +1,51 @@
 const MAX_PROCESSED_PAYMENT_KEYS = 50;
 
-function addInterval(date, interval) {
+interface PayMongoState {
+  checkoutId?: string;
+  paymentId?: string;
+  paymentIntentId?: string;
+  sourceId?: string;
+  lastEventId?: string;
+  lastEventType?: string;
+  processedPaymentKeys?: string[];
+}
+
+interface BillingState {
+  plan?: string;
+  interval?: string;
+  status?: string;
+  currentPeriodEnd?: Date | string | null;
+  autoRenew?: boolean;
+  lastPaymentAt?: Date | null;
+  pendingCheckoutId?: string;
+  pendingPlan?: string;
+  pendingInterval?: string;
+  paymongo?: PayMongoState;
+}
+
+interface AIUsageState {
+  dailyCount?: number;
+  monthlyCount?: number;
+  deepDailyCount?: number;
+  deepMonthlyCount?: number;
+}
+
+interface BillingUser {
+  billing?: BillingState;
+  aiUsage?: AIUsageState;
+}
+
+interface PaymentDetails {
+  paymentKey?: string;
+  checkoutId?: string;
+  paymentId?: string;
+  paymentIntentId?: string;
+  sourceId?: string;
+  eventId?: string;
+  eventType?: string;
+}
+
+function addInterval(date: Date, interval: string): Date {
   const next = new Date(date);
   if (interval === 'weekly') next.setDate(next.getDate() + 7);
   else if (interval === 'yearly') next.setFullYear(next.getFullYear() + 1);
@@ -8,13 +53,13 @@ function addInterval(date, interval) {
   return next;
 }
 
-function isBillingActive(billing, now = new Date()) {
+function isBillingActive(billing: BillingState | null | undefined, now = new Date()): boolean {
   if (!billing?.currentPeriodEnd) return false;
   const end = new Date(billing.currentPeriodEnd);
-  return ['active', 'canceled'].includes(billing?.status) && end.getTime() > now.getTime();
+  return ['active', 'canceled'].includes(billing.status || '') && end.getTime() > now.getTime();
 }
 
-function getBillingSnapshot(billing, now = new Date()) {
+function getBillingSnapshot(billing: BillingState | null | undefined, now = new Date()) {
   const active = isBillingActive(billing, now);
   const plan = billing?.plan || 'free';
   let status = billing?.status || 'free';
@@ -32,25 +77,28 @@ function getBillingSnapshot(billing, now = new Date()) {
   };
 }
 
-function getPaymentKey({ paymentId, eventId, checkoutId, eventType } = {}) {
+function getPaymentKey({ paymentId, eventId, checkoutId, eventType }: PaymentDetails = {}): string {
   if (paymentId) return `payment:${paymentId}`;
   if (eventId) return `event:${eventId}`;
   if (checkoutId && eventType) return `checkout:${checkoutId}:${eventType}`;
   return '';
 }
 
-function applyPaidSubscription(user, interval, details = {}, now = new Date()) {
-  if (!user.billing) user.billing = {};
-  if (!user.billing.paymongo) user.billing.paymongo = {};
+function applyPaidSubscription(
+  user: BillingUser,
+  interval: string,
+  details: PaymentDetails = {},
+  now = new Date(),
+): { applied: boolean; paymentKey: string } {
+  user.billing ??= {};
+  user.billing.paymongo ??= {};
   const paymentKey = details.paymentKey || getPaymentKey(details);
   const processed = user.billing.paymongo.processedPaymentKeys || [];
 
-  if (paymentKey && processed.includes(paymentKey)) {
-    return { applied: false, paymentKey };
-  }
+  if (paymentKey && processed.includes(paymentKey)) return { applied: false, paymentKey };
 
   const currentEnd = user.billing.currentPeriodEnd ? new Date(user.billing.currentPeriodEnd) : null;
-  const base = currentEnd && currentEnd > now ? currentEnd : now;
+  const base = currentEnd && currentEnd.getTime() > now.getTime() ? currentEnd : now;
   user.billing.plan = 'premium';
   user.billing.interval = interval;
   user.billing.status = 'active';
@@ -67,11 +115,10 @@ function applyPaidSubscription(user, interval, details = {}, now = new Date()) {
   if (details.eventId) user.billing.paymongo.lastEventId = details.eventId;
   if (details.eventType) user.billing.paymongo.lastEventType = details.eventType;
   if (paymentKey) {
-    user.billing.paymongo.processedPaymentKeys = [...processed, paymentKey]
-      .slice(-MAX_PROCESSED_PAYMENT_KEYS);
+    user.billing.paymongo.processedPaymentKeys = [...processed, paymentKey].slice(-MAX_PROCESSED_PAYMENT_KEYS);
   }
 
-  if (!user.aiUsage) user.aiUsage = {};
+  user.aiUsage ??= {};
   user.aiUsage.dailyCount = 0;
   user.aiUsage.monthlyCount = 0;
   user.aiUsage.deepDailyCount = 0;
@@ -79,7 +126,7 @@ function applyPaidSubscription(user, interval, details = {}, now = new Date()) {
   return { applied: true, paymentKey };
 }
 
-module.exports = {
+export {
   MAX_PROCESSED_PAYMENT_KEYS,
   addInterval,
   isBillingActive,
@@ -87,3 +134,4 @@ module.exports = {
   getPaymentKey,
   applyPaidSubscription,
 };
+export type { BillingState, BillingUser, PaymentDetails };

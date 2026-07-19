@@ -2,18 +2,20 @@
   "name": "academiazen-backend",
   "version": "1.1.0",
   "description": "AcademiaZen API Server - AI-powered study assistant",
-  "main": "server.js",
+  "main": "dist/server.js",
   "engines": {
     "node": ">=22.12.0"
   },
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
+    "start": "node dist/server.js",
+    "dev": "tsx watch server.js",
+    "build": "tsc --build",
+    "typecheck": "tsc --noEmit",
     "generate-vapid": "node scripts/generate-vapid.js",
-    "test": "vitest",
-    "test:run": "vitest run",
+    "test": "npm run build && vitest",
+    "test:run": "npm run build && vitest run",
     "test:coverage": "vitest run --coverage",
-    "verify": "node --check server.js && vitest run"
+    "verify": "npm run typecheck && npm run build && vitest run"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1090.0",
@@ -36,8 +38,12 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "22.20.1",
     "@vitest/coverage-v8": "4.1.10",
     "supertest": "7.2.2",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2",
     "vitest": "4.1.10"
   }
 }

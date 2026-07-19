@@ -15,6 +15,8 @@
 
 Verify TypeScript 7 is a stable release and supported by Vite/Vitest/Node/Mongoose types at implementation time. A prerelease is not acceptable for production merely to satisfy a nominal target. Use strict options, including unchecked-index and exact-optional checks, without `any` escapes.
 
+TypeScript 7.0.2 is now pinned. The strict build compiles migrated TypeScript services and copies compatibility JavaScript into `dist`; tests import compiled modules. Billing, environment validation, and account-deletion orchestration are the first converted boundaries. Route/provider extraction remains required before `server.js` can be converted without suppressions.
+
 ## Production ordering
 
 Additive backend compatibility deploy -> smoke/observe -> frontend deploy -> adoption window -> later cleanup. Database changes are a separate explicit operation. Rollback always restores the previous application image without requiring a reverse data migration.

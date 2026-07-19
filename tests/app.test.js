@@ -1,5 +1,5 @@
 const request = require('supertest');
-const { app } = require('../server');
+const { app } = require('../dist/server');
 
 describe('application composition', () => {
   it('imports without opening external connections or starting a listener', () => {

@@ -1,4 +1,4 @@
-const { deleteAccount } = require('../services/accountDeletion');
+const { deleteAccount } = require('../dist/services/accountDeletion');
 
 describe('account deletion orchestration', () => {
   it('deletes objects, application records, then the identity', async () => {
