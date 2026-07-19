@@ -12,24 +12,66 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const mongoose = require('mongoose');
 const webpush = require('web-push');
 const crypto = require('crypto');
-const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+} = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
-const { requireAuth, requireAdmin, initFirebaseAdmin } = require('./middleware/auth');
+const { requireAuth, requireAdmin, initFirebaseAdmin, deleteFirebaseUser } = require('./middleware/auth');
 const { User, getDefaultState } = require('./models/User');
 const { FocusSession } = require('./models/FocusSession');
 const PushSubscription = require('./models/PushSubscription');
 const { AILog } = require('./models/AILog');
+const { AIQuotaLock } = require('./models/AIQuotaLock');
+const { acquireAIQuotaLock, releaseAIQuotaLock } = require('./services/aiQuotaLock');
+const { buildStateRevisionFilter, hasValidRevision } = require('./services/stateRevision');
+const {
+  isBillingActive,
+  getBillingSnapshot,
+  getPaymentKey,
+  applyPaidSubscription,
+} = require('./services/billing');
+const { acquireBillingEventLock, releaseBillingEventLock } = require('./services/billingEventLock');
+const { deleteAccount } = require('./services/accountDeletion');
+const { assertProductionEnvironment } = require('./services/envValidation');
+const { verifyPaymongoWebhookSignature } = require('./services/paymongoSignature');
 
 const app = express();
 
 // Trust proxy for rate limiting and correct IPs behind Nginx
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
+
+app.use((req, res, next) => {
+  const requestId = crypto.randomUUID();
+  const startedAt = process.hrtime.bigint();
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
+
+  res.on('finish', () => {
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+    console.log(JSON.stringify({
+      level: 'info',
+      event: 'http_request',
+      requestId,
+      method: req.method,
+      route: req.route?.path || 'unmatched',
+      status: res.statusCode,
+      durationMs: Math.round(durationMs * 100) / 100,
+    }));
+  });
+
+  next();
+});
 
 // ----- Security / middleware -----
 app.use(helmet({
@@ -57,7 +99,7 @@ const reviewerLimiter = rateLimit({
   limit: 10, // Max 10 reviewer generations per hour per user
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.uid || req.ip, // Rate limit by user ID
+  keyGenerator: (req) => req.user?.uid || ipKeyGenerator(req.ip), // Rate limit by user ID or normalized IP
   message: { error: 'Too many reviewer requests. Please wait before creating more reviewers.' },
 });
 
@@ -89,11 +131,27 @@ const AI_LIMITS = {
  * Must be used AFTER requireAuth middleware
  */
 async function aiUsageGuard(req, res, next) {
+  let lockOwner = null;
+  let lockUid = null;
   try {
     const uid = req.user?.uid;
     if (!uid) {
       return res.status(401).json({ error: 'Authentication required' });
     }
+
+    const owner = req.requestId || crypto.randomUUID();
+    const acquired = await acquireAIQuotaLock(uid, owner);
+    if (!acquired) {
+      res.setHeader('Retry-After', '1');
+      return res.status(429).json({
+        error: 'quota_check_in_progress',
+        message: 'Another AI request is being checked. Please retry in a moment.',
+        requestId: req.requestId,
+        retryAfter: 1,
+      });
+    }
+    lockOwner = owner;
+    lockUid = uid;
 
     const user = await User.findOne({ uid });
     if (!user) {
@@ -262,11 +320,22 @@ async function aiUsageGuard(req, res, next) {
     // Save usage update
     await user.save();
 
-    next();
+    return next();
   } catch (err) {
     console.error('[aiUsageGuard] Error:', err);
-    // Don't block on guard errors - fail open but log
-    next();
+    return res.status(503).json({
+      error: 'quota_guard_unavailable',
+      message: 'AI usage could not be verified. Please try again shortly.',
+      requestId: req.requestId,
+    });
+  } finally {
+    if (lockUid && lockOwner) {
+      try {
+        await releaseAIQuotaLock(lockUid, lockOwner);
+      } catch (releaseError) {
+        console.error('[aiUsageGuard] Failed to release quota lock:', releaseError);
+      }
+    }
   }
 }
 
@@ -346,36 +415,31 @@ app.use(cors({
   credentials: true,
 }));
 
-// ----- Firebase Admin -----
-initFirebaseAdmin();
-
-// ----- MongoDB -----
+// ----- Infrastructure initialization -----
 const MONGODB_URI = process.env.MONGODB_URI;
-if (!MONGODB_URI) {
-  console.error('Missing MONGODB_URI in environment');
-  process.exit(1);
+
+async function initializeInfrastructure() {
+  assertProductionEnvironment();
+  initFirebaseAdmin();
+
+  if (!MONGODB_URI) {
+    throw new Error('Missing MONGODB_URI in environment');
+  }
+  if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
+    throw new Error('VAPID keys not found. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY.');
+  }
+
+  await mongoose.connect(MONGODB_URI, {
+    autoIndex: process.env.NODE_ENV !== 'production',
+  });
+  console.log(JSON.stringify({ level: 'info', event: 'mongodb_connected' }));
+
+  webpush.setVapidDetails(
+    process.env.VAPID_EMAIL || 'mailto:admin@academiazen.app',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
 }
-
-mongoose.connect(MONGODB_URI, {
-  autoIndex: true,
-}).then(() => {
-  console.log('MongoDB connected');
-}).catch(err => {
-  console.error('MongoDB connection error:', err);
-  process.exit(1);
-});
-
-// ----- Web Push -----
-if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
-  console.error('VAPID keys not found. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY.');
-  process.exit(1);
-}
-
-webpush.setVapidDetails(
-  process.env.VAPID_EMAIL || 'mailto:admin@academiazen.app',
-  process.env.VAPID_PUBLIC_KEY,
-  process.env.VAPID_PRIVATE_KEY
-);
 
 // ----- Helpers -----
 async function getOrCreateUser(uid, email) {
@@ -532,6 +596,7 @@ const BILLING_COUPON_SECRET = resolveEnvRef(process.env.BILLING_COUPON_SECRET);
 const BILLING_COUPON_INTERVAL = (process.env.BILLING_COUPON_INTERVAL || 'monthly').toLowerCase();
 const BILLING_COUPON_METHOD = (process.env.BILLING_COUPON_METHOD || 'qrph').toLowerCase();
 const BILLING_COUPON_DIRECT_GRANT = process.env.BILLING_COUPON_DIRECT_GRANT === 'true';
+const PAYMONGO_WEBHOOK_TOLERANCE_SECONDS = Number(process.env.PAYMONGO_WEBHOOK_TOLERANCE_SECONDS || 300);
 
 const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
 const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
@@ -566,6 +631,15 @@ const R2_PUBLIC_BASE_URL = process.env.R2_PUBLIC_BASE_URL || '';
 const R2_SIGNED_URL_TTL = Number(process.env.R2_SIGNED_URL_TTL || 900);
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 15 * 1024 * 1024);
 const MAX_PDF_TEXT_CHARS = Number(process.env.MAX_PDF_TEXT_CHARS || 12000);
+const EXTERNAL_REQUEST_TIMEOUT_MS = Number(process.env.EXTERNAL_REQUEST_TIMEOUT_MS || 60_000);
+const AI_STREAM_TIMEOUT_MS = Number(process.env.AI_STREAM_TIMEOUT_MS || 120_000);
+
+function fetchWithTimeout(url, options = {}, timeoutMs = EXTERNAL_REQUEST_TIMEOUT_MS) {
+  return fetch(url, {
+    ...options,
+    signal: options.signal || AbortSignal.timeout(timeoutMs),
+  });
+}
 
 let r2Client;
 function getR2Client() {
@@ -591,6 +665,29 @@ function ensureR2() {
     throw new Error('R2 is not configured');
   }
   return client;
+}
+
+async function deleteR2Prefix(uid) {
+  const client = getR2Client();
+  if (!client && !R2_BUCKET && !R2_ENDPOINT) return;
+  if (!client || !R2_BUCKET) throw new Error('R2 account deletion is not fully configured');
+
+  let continuationToken;
+  do {
+    const listed = await client.send(new ListObjectsV2Command({
+      Bucket: R2_BUCKET,
+      Prefix: `${uid}/`,
+      ContinuationToken: continuationToken,
+    }));
+    const objects = (listed.Contents || []).map(({ Key }) => ({ Key })).filter(({ Key }) => Key);
+    if (objects.length) {
+      await client.send(new DeleteObjectsCommand({
+        Bucket: R2_BUCKET,
+        Delete: { Objects: objects, Quiet: true },
+      }));
+    }
+    continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+  } while (continuationToken);
 }
 
 function isOwnedKey(key, uid) {
@@ -643,44 +740,6 @@ function getCheckoutUrls() {
   return {
     success: `${frontend.replace(/\/+$/, '')}/?billing=success`,
     cancel: `${frontend.replace(/\/+$/, '')}/?billing=cancel`,
-  };
-}
-
-function addInterval(date, interval) {
-  const next = new Date(date);
-  if (interval === 'weekly') {
-    next.setDate(next.getDate() + 7);
-  } else if (interval === 'yearly') {
-    next.setFullYear(next.getFullYear() + 1);
-  } else {
-    next.setMonth(next.getMonth() + 1);
-  }
-  return next;
-}
-
-function isBillingActive(billing) {
-  if (!billing?.currentPeriodEnd) return false;
-  const end = new Date(billing.currentPeriodEnd);
-  const status = billing?.status;
-  return (status === 'active' || status === 'canceled') && end.getTime() > Date.now();
-}
-
-function getBillingSnapshot(billing) {
-  const active = isBillingActive(billing);
-  const plan = billing?.plan || 'free';
-  const autoRenew = plan === 'premium' ? (billing?.autoRenew ?? true) : false;
-  let status = billing?.status || 'free';
-  if ((status === 'active' || status === 'canceled') && !active) status = 'expired';
-  if (status === 'pending' && !billing?.pendingCheckoutId) status = 'free';
-  return {
-    plan,
-    interval: billing?.interval || 'none',
-    status,
-    currentPeriodEnd: billing?.currentPeriodEnd ? new Date(billing.currentPeriodEnd).toISOString() : null,
-    autoRenew,
-    isActive: active,
-    effectivePlan: active ? plan : 'free',
-    pendingCheckoutId: billing?.pendingCheckoutId || '',
   };
 }
 
@@ -804,38 +863,6 @@ async function getFocusAnalytics(uid) {
   };
 }
 
-function applyPaidSubscription(user, interval, details = {}) {
-  if (!user.billing) user.billing = {};
-  if (!user.billing.paymongo) user.billing.paymongo = {};
-  const now = new Date();
-  const currentEnd = user.billing?.currentPeriodEnd ? new Date(user.billing.currentPeriodEnd) : null;
-  const base = currentEnd && currentEnd > now ? currentEnd : now;
-  const nextEnd = addInterval(base, interval);
-
-  user.billing.plan = 'premium';
-  user.billing.interval = interval;
-  user.billing.status = 'active';
-  user.billing.currentPeriodEnd = nextEnd;
-  user.billing.lastPaymentAt = now;
-  user.billing.pendingCheckoutId = '';
-  user.billing.pendingPlan = '';
-  user.billing.pendingInterval = '';
-
-  if (details.checkoutId) user.billing.paymongo.checkoutId = details.checkoutId;
-  if (details.paymentId) user.billing.paymongo.paymentId = details.paymentId;
-  if (details.paymentIntentId) user.billing.paymongo.paymentIntentId = details.paymentIntentId;
-  if (details.sourceId) user.billing.paymongo.sourceId = details.sourceId;
-  if (details.eventId) user.billing.paymongo.lastEventId = details.eventId;
-  if (details.eventType) user.billing.paymongo.lastEventType = details.eventType;
-
-  // Reset AI usage counters on subscription activation/renewal
-  if (!user.aiUsage) user.aiUsage = {};
-  user.aiUsage.dailyCount = 0;
-  user.aiUsage.monthlyCount = 0;
-  user.aiUsage.deepDailyCount = 0;
-  user.aiUsage.deepMonthlyCount = 0;
-}
-
 function buildPaymongoAuthHeader() {
   const token = Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64');
   return `Basic ${token}`;
@@ -846,7 +873,7 @@ async function paymongoRequest(path, { method = 'GET', body } = {}) {
     throw new Error('PAYMONGO_SECRET_KEY is not configured');
   }
 
-  const response = await fetch(`${PAYMONGO_API_BASE}${path}`, {
+  const response = await fetchWithTimeout(`${PAYMONGO_API_BASE}${path}`, {
     method,
     headers: {
       'Content-Type': 'application/json',
@@ -883,7 +910,7 @@ async function openrouterRequest(path, { method = 'POST', body } = {}) {
     headers['X-Title'] = OPENROUTER_APP_TITLE;
   }
 
-  const response = await fetch(`${AI_BASE_URL}${path}`, {
+  const response = await fetchWithTimeout(`${AI_BASE_URL}${path}`, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
@@ -906,7 +933,7 @@ async function deepseekReviewerRequest(messages, maxTokens = 8000) {
     throw new Error('DEEPSEEK_REVIEWER_API_KEY is not configured');
   }
 
-  const response = await fetch(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
+  const response = await fetchWithTimeout(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -936,7 +963,7 @@ async function deepseekChatRequest(model, messages, maxTokens = 1200, temperatur
     throw new Error('DEEPSEEK_REVIEWER_API_KEY is not configured');
   }
 
-  const response = await fetch(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
+  const response = await fetchWithTimeout(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -967,34 +994,14 @@ function verifyPaymongoSignature(req) {
   }
   const header = req.headers['paymongo-signature'];
   if (!header || !req.rawBody) return false;
-
-  const raw = req.rawBody.toString('utf8');
-  const parts = String(header).split(',').map(p => p.trim());
-  let timestamp = null;
-  const signatures = [];
-  for (const part of parts) {
-    if (part.startsWith('t=')) timestamp = part.slice(2);
-    if (part.startsWith('v1=')) signatures.push(part.slice(3));
-    if (part.startsWith('sig=')) signatures.push(part.slice(4));
-  }
-  if (!signatures.length && header) signatures.push(String(header).trim());
-
-  const candidates = [];
-  if (timestamp) {
-    candidates.push(crypto.createHmac('sha256', PAYMONGO_WEBHOOK_SECRET).update(`${timestamp}.${raw}`).digest('hex'));
-  }
-  candidates.push(crypto.createHmac('sha256', PAYMONGO_WEBHOOK_SECRET).update(raw).digest('hex'));
-
-  return signatures.some(sig => {
-    try {
-      const sigBuf = Buffer.from(String(sig).trim(), 'hex');
-      return candidates.some(candidate => {
-        const candBuf = Buffer.from(candidate, 'hex');
-        return sigBuf.length === candBuf.length && crypto.timingSafeEqual(sigBuf, candBuf);
-      });
-    } catch (_) {
-      return false;
-    }
+  const livemode = req.body?.data?.attributes?.livemode;
+  if (typeof livemode !== 'boolean') return false;
+  return verifyPaymongoWebhookSignature({
+    rawBody: req.rawBody,
+    header: String(header),
+    secret: PAYMONGO_WEBHOOK_SECRET,
+    livemode,
+    toleranceSeconds: PAYMONGO_WEBHOOK_TOLERANCE_SECONDS,
   });
 }
 
@@ -1015,6 +1022,18 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+app.get('/live', (req, res) => {
+  res.json({ status: 'ok', requestId: req.requestId });
+});
+
+app.get('/ready', (req, res) => {
+  const ready = mongoose.connection.readyState === 1;
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not_ready',
+    requestId: req.requestId,
+  });
+});
+
 // Auth ping (public - for frontend to verify API is reachable)
 app.get('/api/auth/ping', (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
@@ -1027,7 +1046,7 @@ app.get('/api/me', requireAuth, async (req, res) => {
     res.json({
       uid: user.uid,
       email: user.email,
-      billing: user.billing || {},
+      billing: getBillingSnapshot(user.billing || {}),
       createdAt: user.createdAt,
     });
   } catch (err) {
@@ -1348,12 +1367,10 @@ app.post('/api/billing/secret-checkout', requireAuth, checkoutLimiter, async (re
     }
 
     if (BILLING_COUPON_DIRECT_GRANT) {
-      applyPaidSubscription(user, interval, {
-        eventType: 'coupon.grant',
-        eventId: `coupon-${Date.now()}`,
+      return res.status(503).json({
+        error: 'Direct coupon grants are disabled. Use provider-verified checkout.',
+        code: 'DIRECT_GRANT_DISABLED',
       });
-      await user.save();
-      return res.json({ direct: true, billing: getBillingSnapshot(user.billing) });
     }
 
     const { success, cancel } = getCheckoutUrls();
@@ -1514,7 +1531,11 @@ app.post('/api/billing/refresh', requireAuth, async (req, res) => {
     if (isCheckoutPaid(checkout)) {
       const interval = user.billing.pendingInterval || user.billing.interval || 'monthly';
       const paymentId = checkout?.data?.attributes?.payments?.[0]?.id;
-      applyPaidSubscription(user, interval, { checkoutId, paymentId });
+      applyPaidSubscription(user, interval, {
+        checkoutId,
+        paymentId,
+        eventType: 'checkout.refresh',
+      });
       await user.save();
       return res.json({ updated: true, billing: getBillingSnapshot(user.billing || {}) });
     }
@@ -1879,6 +1900,7 @@ app.get('/api/focus/suggestions', requireAuth, async (req, res) => {
 });
 
 app.post('/api/billing/webhook/paymongo', async (req, res) => {
+  let lock;
   try {
     if (!verifyPaymongoSignature(req)) {
       return res.status(400).json({ error: 'Invalid signature' });
@@ -1889,15 +1911,26 @@ app.post('/api/billing/webhook/paymongo', async (req, res) => {
     const eventId = event?.id;
     const resource = event?.attributes?.data;
     const checkoutId = resource?.id;
+    const paymentId = resource?.attributes?.payments?.[0]?.id;
 
     if (!eventType || !checkoutId) {
       return res.json({ received: true });
+    }
+
+    const paymentKey = getPaymentKey({ paymentId, eventId, checkoutId, eventType });
+    const lockOwner = req.requestId || crypto.randomUUID();
+    if (String(eventType).includes('payment.') && paymentKey) {
+      const acquired = await acquireBillingEventLock(paymentKey, lockOwner);
+      if (!acquired) return res.json({ received: true, duplicate: true });
+      lock = { key: paymentKey, owner: lockOwner };
     }
 
     const user = await User.findOne({ 'billing.pendingCheckoutId': checkoutId })
       || await User.findOne({ 'billing.paymongo.checkoutId': checkoutId });
 
     if (!user) {
+      if (lock) await releaseBillingEventLock(lock.key, lock.owner);
+      lock = null;
       return res.json({ received: true });
     }
     if (!user.billing) user.billing = {};
@@ -1905,8 +1938,13 @@ app.post('/api/billing/webhook/paymongo', async (req, res) => {
 
     if (String(eventType).includes('payment.paid')) {
       const interval = user.billing.pendingInterval || user.billing.interval || 'monthly';
-      const paymentId = resource?.attributes?.payments?.[0]?.id;
-      applyPaidSubscription(user, interval, { checkoutId, paymentId, eventId, eventType });
+      applyPaidSubscription(user, interval, {
+        checkoutId,
+        paymentId,
+        eventId,
+        eventType,
+        paymentKey,
+      });
       await user.save();
     } else if (String(eventType).includes('payment.failed')) {
       user.billing.status = 'past_due';
@@ -1915,8 +1953,14 @@ app.post('/api/billing/webhook/paymongo', async (req, res) => {
       await user.save();
     }
 
+    if (lock) await releaseBillingEventLock(lock.key, lock.owner);
+    lock = null;
+
     res.json({ received: true });
   } catch (err) {
+    if (lock) {
+      await releaseBillingEventLock(lock.key, lock.owner).catch(() => {});
+    }
     console.error('PayMongo webhook failed:', err);
     res.status(500).json({ error: 'Webhook handling failed' });
   }
@@ -1950,7 +1994,7 @@ app.get('/api/state', requireAuth, async (req, res) => {
     }
     
     console.log(`[SYNC] Returning state for ${req.user.email}: tasks=${user.state?.tasks?.length || 0}, subjects=${user.state?.subjects?.length || 0}`);
-    res.json({ state: user.state });
+    res.json({ state: user.state, revision: user.stateRevision || 0 });
   } catch (err) {
     console.error('Failed to get state:', err);
     res.status(500).json({ error: 'Failed to load state' });
@@ -1960,7 +2004,7 @@ app.get('/api/state', requireAuth, async (req, res) => {
 app.put('/api/state', requireAuth, async (req, res) => {
   console.log(`[SYNC] PUT /api/state from ${req.user.email}`);
   try {
-    const { state } = req.body;
+    const { state, baseRevision } = req.body;
     if (!isValidState(state)) {
       console.log(`[SYNC] Invalid state payload from ${req.user.email}`);
       return res.status(400).json({ error: 'Invalid state payload' });
@@ -2007,20 +2051,32 @@ app.put('/api/state', requireAuth, async (req, res) => {
     
     // Use findOneAndUpdate with $set to ensure the state is saved
     // This bypasses Mongoose's change detection which can be buggy with nested objects
+    const revisionProvided = hasValidRevision(baseRevision);
     const updateResult = await User.findOneAndUpdate(
-      { uid: req.user.uid },
+      buildStateRevisionFilter(req.user.uid, baseRevision),
       { 
         $set: { 
           state: sanitizedState,
           email: req.user.email || user.email
-        }
+        },
+        $inc: { stateRevision: 1 },
       },
       { new: true }
     );
+
+    if (!updateResult && revisionProvided) {
+      const current = await User.findOne({ uid: req.user.uid }).select('stateRevision').lean();
+      return res.status(409).json({
+        error: 'State changed in another session',
+        code: 'STATE_CONFLICT',
+        revision: current?.stateRevision || 0,
+        requestId: req.requestId,
+      });
+    }
     
     console.log(`[SYNC] SAVED for ${req.user.email}: tasks=${updateResult?.state?.tasks?.length || 0}, subjects=${updateResult?.state?.subjects?.length || 0}`);
     
-    res.json({ success: true });
+    res.json({ success: true, revision: updateResult?.stateRevision || 0 });
   } catch (err) {
     console.error('Failed to save state:', err);
     res.status(500).json({ error: 'Failed to save state' });
@@ -2029,11 +2085,20 @@ app.put('/api/state', requireAuth, async (req, res) => {
 
 app.delete('/api/account', requireAuth, async (req, res) => {
   try {
-    await Promise.all([
-      User.deleteOne({ uid: req.user.uid }),
-      PushSubscription.deleteMany({ uid: req.user.uid }),
-      FocusSession.deleteMany({ uid: req.user.uid }),
-    ]);
+    await deleteAccount({
+      uid: req.user.uid,
+      deleteObjects: deleteR2Prefix,
+      deleteDocuments: async (uid) => {
+        await Promise.all([
+          User.deleteOne({ uid }),
+          PushSubscription.deleteMany({ uid }),
+          FocusSession.deleteMany({ uid }),
+          AILog.deleteMany({ uid }),
+          AIQuotaLock.deleteOne({ _id: uid }),
+        ]);
+      },
+      deleteIdentity: deleteFirebaseUser,
+    });
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to delete account data:', err);
@@ -2554,7 +2619,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
       const selectedModel = isDeep ? AI_MODEL_PREMIUM_DEEP : AI_MODEL_PREMIUM_FAST;
       const maxTokens = isDeep ? AI_MAX_TOKENS_DEEP : AI_MAX_TOKENS_FAST;
       
-      const response = await fetch(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
+      const response = await fetchWithTimeout(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2567,7 +2632,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
           messages,
           stream: true,
         }),
-      });
+      }, AI_STREAM_TIMEOUT_MS);
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -2623,7 +2688,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
       if (OPENROUTER_SITE_URL) headers['HTTP-Referer'] = OPENROUTER_SITE_URL;
       if (OPENROUTER_APP_TITLE) headers['X-Title'] = OPENROUTER_APP_TITLE;
 
-      const response = await fetch(`${AI_BASE_URL}/chat/completions`, {
+      const response = await fetchWithTimeout(`${AI_BASE_URL}/chat/completions`, {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -2633,7 +2698,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
           messages,
           stream: true,
         }),
-      });
+      }, AI_STREAM_TIMEOUT_MS);
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -3414,15 +3479,21 @@ async function checkStudyReminders() {
 
 const TWO_HOURS = 2 * 60 * 60 * 1000;
 const TEN_MINUTES = 10 * 60 * 1000;
-setInterval(checkTaskDeadlines, TWO_HOURS);
-setInterval(checkDailyBriefings, TEN_MINUTES);
-setInterval(checkStudyReminders, TEN_MINUTES);
-setTimeout(checkTaskDeadlines, 30000);
-setTimeout(checkDailyBriefings, 30000);
-setTimeout(checkStudyReminders, 30000);
+
+function startBackgroundJobs() {
+  const timers = [
+    setInterval(checkTaskDeadlines, TWO_HOURS),
+    setInterval(checkDailyBriefings, TEN_MINUTES),
+    setInterval(checkStudyReminders, TEN_MINUTES),
+    setTimeout(checkTaskDeadlines, 30000),
+    setTimeout(checkDailyBriefings, 30000),
+    setTimeout(checkStudyReminders, 30000),
+  ];
+  return () => timers.forEach(clearTimeout);
+}
 
 // ----- 404 Handler (must be last) -----
-app.use('/api/*', (req, res) => {
+app.use('/api/{*path}', (req, res) => {
   res.status(404).json({ 
     error: 'Not Found', 
     message: `Endpoint ${req.method} ${req.originalUrl} does not exist`,
@@ -3439,6 +3510,62 @@ app.use('/api/*', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`AcademiaZen API listening on port ${PORT}`);
-});
+
+async function startServer() {
+  await initializeInfrastructure();
+  const stopBackgroundJobs = startBackgroundJobs();
+  const server = app.listen(PORT, () => {
+    console.log(JSON.stringify({ level: 'info', event: 'server_listening', port: Number(PORT) }));
+  });
+
+  const shutdown = async (signal = 'manual') => {
+    console.log(JSON.stringify({ level: 'info', event: 'shutdown_started', signal }));
+    stopBackgroundJobs();
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await mongoose.disconnect();
+    console.log(JSON.stringify({ level: 'info', event: 'shutdown_complete', signal }));
+  };
+
+  return { server, shutdown };
+}
+
+if (require.main === module) {
+  startServer()
+    .then(({ shutdown }) => {
+      let shuttingDown = false;
+      const handleSignal = async (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        try {
+          await shutdown(signal);
+          process.exitCode = 0;
+        } catch (error) {
+          console.error(JSON.stringify({
+            level: 'error',
+            event: 'shutdown_failed',
+            message: error instanceof Error ? error.message : 'Unknown shutdown error',
+          }));
+          process.exitCode = 1;
+        }
+      };
+      process.once('SIGTERM', () => void handleSignal('SIGTERM'));
+      process.once('SIGINT', () => void handleSignal('SIGINT'));
+    })
+    .catch((error) => {
+      console.error(JSON.stringify({
+        level: 'error',
+        event: 'startup_failed',
+        message: error instanceof Error ? error.message : 'Unknown startup error',
+      }));
+      process.exitCode = 1;
+    });
+}
+
+module.exports = {
+  app,
+  initializeInfrastructure,
+  startBackgroundJobs,
+  startServer,
+};

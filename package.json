@@ -2,26 +2,32 @@
   "name": "academiazen-backend",
   "version": "1.1.0",
   "description": "AcademiaZen API Server - AI-powered study assistant",
-  "main": "server.js",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
+    "start": "node dist/server.js",
+    "dev": "tsx watch server.js",
+    "build": "tsc --build",
+    "typecheck": "tsc --noEmit",
     "generate-vapid": "node scripts/generate-vapid.js",
-    "test": "vitest",
-    "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test": "npm run build && vitest",
+    "test:run": "npm run build && vitest run",
+    "test:coverage": "vitest run --coverage",
+    "verify": "npm run typecheck && npm run build && vitest run"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.895.0",
-    "@aws-sdk/s3-request-presigner": "^3.895.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2",
-    "express-rate-limit": "^7.5.0",
-    "firebase-admin": "^12.7.0",
-    "helmet": "^7.2.0",
-    "mongoose": "^8.10.0",
-    "web-push": "^3.6.6"
+    "@aws-sdk/client-s3": "3.1090.0",
+    "@aws-sdk/s3-request-presigner": "3.1090.0",
+    "cors": "2.8.6",
+    "dotenv": "17.4.2",
+    "express": "5.2.1",
+    "express-rate-limit": "8.6.0",
+    "firebase-admin": "14.2.0",
+    "helmet": "8.3.0",
+    "mongoose": "8.24.1",
+    "web-push": "3.6.7"
   },
   "keywords": [
     "push-notifications",
@@ -32,8 +38,12 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "@vitest/coverage-v8": "^4.0.18",
-    "supertest": "^7.2.2",
-    "vitest": "^4.0.18"
+    "@types/express": "5.0.6",
+    "@types/node": "22.20.1",
+    "@vitest/coverage-v8": "4.1.10",
+    "supertest": "7.2.2",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
   }
 }

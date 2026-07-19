@@ -151,6 +151,7 @@ const BillingSchema = new mongoose.Schema({
     sourceId: { type: String, default: '' },
     lastEventId: { type: String, default: '' },
     lastEventType: { type: String, default: '' },
+    processedPaymentKeys: { type: [String], default: [] },
   },
 }, { _id: false });
 
@@ -197,6 +198,7 @@ const UserSchema = new mongoose.Schema({
   uid: { type: String, required: true, unique: true, index: true },
   email: { type: String, default: '' },
   state: { type: ZenStateSchema, default: () => getDefaultState() },
+  stateRevision: { type: Number, default: 0, min: 0 },
   notificationMeta: { type: NotificationMetaSchema, default: () => ({}) },
   billing: { type: BillingSchema, default: () => ({}) },
   aiUsage: { type: AIUsageSchema, default: () => ({}) },

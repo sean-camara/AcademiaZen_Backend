@@ -1,16 +1,19 @@
-FROM node:20-alpine
+FROM node:22.19-alpine
 
 # Install curl for health checks
 RUN apk add --no-cache curl
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci --omit=dev
+COPY --chown=node:node package*.json ./
+RUN npm ci
 
-COPY . .
+COPY --chown=node:node . .
+RUN npm run build && npm prune --omit=dev
 
 ENV NODE_ENV=production
 EXPOSE 3001
 
-CMD ["node", "server.js"]
+USER node
+
+CMD ["node", "dist/server.js"]
