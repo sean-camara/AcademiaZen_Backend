@@ -25,7 +25,8 @@
     "middleware/**/*",
     "models/**/*",
     "services/**/*",
-    "scripts/**/*"
+    "scripts/**/*",
+    "types/**/*"
   ],
   "exclude": ["dist", "node_modules", "tests"]
 }
