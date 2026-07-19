@@ -9,7 +9,7 @@ const AILogSchema = new mongoose.Schema({
   uid: { type: String, required: true, index: true },
   
   // Request details
-  endpoint: { type: String, required: true, enum: ['chat', 'reviewer', 'other'] },
+  endpoint: { type: String, required: true, enum: ['chat', 'chat-stream', 'reviewer', 'other'] },
   model: { type: String, default: '' },
   mode: { type: String, default: '' }, // 'fast', 'deep', etc.
   
