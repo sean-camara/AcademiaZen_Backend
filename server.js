@@ -43,6 +43,7 @@ const {
 const { acquireBillingEventLock, releaseBillingEventLock } = require('./services/billingEventLock');
 const { deleteAccount } = require('./services/accountDeletion');
 const { assertProductionEnvironment } = require('./services/envValidation');
+const { createAILimits } = require('./services/aiLimits');
 const { verifyPaymongoWebhookSignature } = require('./services/paymongoSignature');
 
 const app = express();
@@ -104,26 +105,7 @@ const reviewerLimiter = rateLimit({
 });
 
 // ========== AI USAGE LIMITS (Per-User Quota System) ==========
-const FREE_COOLDOWN_HOURS = Number(process.env.FREE_COOLDOWN_HOURS || 12);
-const FREE_COOLDOWN_MESSAGES = Number(process.env.FREE_COOLDOWN_MESSAGES || 5);
-
-const AI_LIMITS = {
-  free: {
-    requestsPerMinute: 5,      // Max 5 requests per minute
-    dailyCap: 30,              // Soft daily cap (cooldown is primary gate)
-    monthlyCap: 500,           // Soft cap for analytics
-    deepDailyCap: 5,           // Max 5 deep reasoning requests per day
-    cooldownHours: FREE_COOLDOWN_HOURS,   // 12-hour cooldown after messages used
-    cooldownMessages: FREE_COOLDOWN_MESSAGES, // 5 messages per window
-  },
-  premium: {
-    requestsPerMinute: 15,     // Max 15 requests per minute
-    dailyCap: 30,              // Max 30 requests per day
-    monthlyCap: 300,           // Max 300 requests per month
-    deepDailyCap: 10,          // Max 10 deep reasoning requests per day
-    deepMonthlyCap: 40,        // Max 40 deep reasoning requests per month
-  },
-};
+const AI_LIMITS = createAILimits(process.env);
 
 /**
  * AI Usage Guard Middleware
