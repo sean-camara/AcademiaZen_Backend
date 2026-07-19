@@ -1,5 +1,5 @@
-const { BillingEventLock } = require('../models/BillingEventLock');
-const { acquireBillingEventLock, releaseBillingEventLock } = require('../services/billingEventLock');
+const { BillingEventLock } = require('../dist/models/BillingEventLock');
+const { acquireBillingEventLock, releaseBillingEventLock } = require('../dist/services/billingEventLock');
 
 describe('billing event lock', () => {
   afterEach(() => vi.restoreAllMocks());

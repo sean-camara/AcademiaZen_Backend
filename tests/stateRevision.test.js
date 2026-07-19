@@ -1,4 +1,4 @@
-const { buildStateRevisionFilter, hasValidRevision } = require('../services/stateRevision');
+const { buildStateRevisionFilter, hasValidRevision } = require('../dist/services/stateRevision');
 
 describe('state revision filters', () => {
   it('keeps old clients compatible when no revision is supplied', () => {

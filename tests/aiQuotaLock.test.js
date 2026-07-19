@@ -1,5 +1,5 @@
-const { AIQuotaLock } = require('../models/AIQuotaLock');
-const { acquireAIQuotaLock, releaseAIQuotaLock } = require('../services/aiQuotaLock');
+const { AIQuotaLock } = require('../dist/models/AIQuotaLock');
+const { acquireAIQuotaLock, releaseAIQuotaLock } = require('../dist/services/aiQuotaLock');
 
 describe('AI quota lock', () => {
   afterEach(() => vi.restoreAllMocks());
