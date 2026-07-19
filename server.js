@@ -43,6 +43,7 @@ const {
 const { acquireBillingEventLock, releaseBillingEventLock } = require('./services/billingEventLock');
 const { deleteAccount } = require('./services/accountDeletion');
 const { assertProductionEnvironment } = require('./services/envValidation');
+const { verifyPaymongoWebhookSignature } = require('./services/paymongoSignature');
 
 const app = express();
 
@@ -595,6 +596,7 @@ const BILLING_COUPON_SECRET = resolveEnvRef(process.env.BILLING_COUPON_SECRET);
 const BILLING_COUPON_INTERVAL = (process.env.BILLING_COUPON_INTERVAL || 'monthly').toLowerCase();
 const BILLING_COUPON_METHOD = (process.env.BILLING_COUPON_METHOD || 'qrph').toLowerCase();
 const BILLING_COUPON_DIRECT_GRANT = process.env.BILLING_COUPON_DIRECT_GRANT === 'true';
+const PAYMONGO_WEBHOOK_TOLERANCE_SECONDS = Number(process.env.PAYMONGO_WEBHOOK_TOLERANCE_SECONDS || 300);
 
 const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
 const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
@@ -992,34 +994,14 @@ function verifyPaymongoSignature(req) {
   }
   const header = req.headers['paymongo-signature'];
   if (!header || !req.rawBody) return false;
-
-  const raw = req.rawBody.toString('utf8');
-  const parts = String(header).split(',').map(p => p.trim());
-  let timestamp = null;
-  const signatures = [];
-  for (const part of parts) {
-    if (part.startsWith('t=')) timestamp = part.slice(2);
-    if (part.startsWith('v1=')) signatures.push(part.slice(3));
-    if (part.startsWith('sig=')) signatures.push(part.slice(4));
-  }
-  if (!signatures.length && header) signatures.push(String(header).trim());
-
-  const candidates = [];
-  if (timestamp) {
-    candidates.push(crypto.createHmac('sha256', PAYMONGO_WEBHOOK_SECRET).update(`${timestamp}.${raw}`).digest('hex'));
-  }
-  candidates.push(crypto.createHmac('sha256', PAYMONGO_WEBHOOK_SECRET).update(raw).digest('hex'));
-
-  return signatures.some(sig => {
-    try {
-      const sigBuf = Buffer.from(String(sig).trim(), 'hex');
-      return candidates.some(candidate => {
-        const candBuf = Buffer.from(candidate, 'hex');
-        return sigBuf.length === candBuf.length && crypto.timingSafeEqual(sigBuf, candBuf);
-      });
-    } catch (_) {
-      return false;
-    }
+  const livemode = req.body?.data?.attributes?.livemode;
+  if (typeof livemode !== 'boolean') return false;
+  return verifyPaymongoWebhookSignature({
+    rawBody: req.rawBody,
+    header: String(header),
+    secret: PAYMONGO_WEBHOOK_SECRET,
+    livemode,
+    toleranceSeconds: PAYMONGO_WEBHOOK_TOLERANCE_SECONDS,
   });
 }
 
@@ -1064,7 +1046,7 @@ app.get('/api/me', requireAuth, async (req, res) => {
     res.json({
       uid: user.uid,
       email: user.email,
-      billing: user.billing || {},
+      billing: getBillingSnapshot(user.billing || {}),
       createdAt: user.createdAt,
     });
   } catch (err) {

@@ -28,10 +28,12 @@ describe('production environment validation', () => {
       FIREBASE_PRIVATE_KEY: '',
       FRONTEND_URL: 'http://academiazen.app',
       ALLOW_NULL_ORIGIN: 'true',
+      PAYMONGO_WEBHOOK_TOLERANCE_SECONDS: 'not-a-number',
     });
     expect(errors).toContain('Firebase Admin credentials are required');
     expect(errors).toContain('FRONTEND_URL must use HTTPS in production');
     expect(errors).toContain('ALLOW_NULL_ORIGIN must not be enabled in production');
+    expect(errors).toContain('PAYMONGO_WEBHOOK_TOLERANCE_SECONDS must be a non-negative number');
   });
 
   it('reports variable names without leaking their values', () => {

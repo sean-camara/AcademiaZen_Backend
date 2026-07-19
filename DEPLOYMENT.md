@@ -16,6 +16,8 @@
 
 This release adds no destructive database migration. Mongoose applies additive defaults for `billing.paymongo.processedPaymentKeys`; existing users and old clients remain compatible. Before candidate startup, verify `FRONTEND_URL` is HTTPS, null-origin CORS is disabled, and existing Firebase, MongoDB, and VAPID variables are present. Optional `EXTERNAL_REQUEST_TIMEOUT_MS` and `AI_STREAM_TIMEOUT_MS` values are milliseconds and default to 60000 and 120000.
 
+Confirm the configured `PAYMONGO_WEBHOOK_SECRET` is the endpoint secret (`whsk_...`), not the API secret key. The optional `PAYMONGO_WEBHOOK_TOLERANCE_SECONDS` defaults to 300. Verify VPS time synchronization before rollout; a badly skewed clock will correctly reject signed deliveries as stale.
+
 ## Rollout
 
 Build the backend image without replacing the live container, label it with the commit, start a candidate on a private alternate port/network if capacity permits, verify `/live` and `/ready`, then update Compose to the immutable image and recreate only the backend. Verify local and reverse-proxy health, unauthenticated rejection, designated test-account API, Mongo, logs, resources, and provider smoke within cost/safety limits. Deploy the frontend only after backend compatibility is observed.

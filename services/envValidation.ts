@@ -31,6 +31,12 @@ function validateProductionEnvironment(env: Environment): string[] {
   }
 
   if (env.ALLOW_NULL_ORIGIN === 'true') errors.push('ALLOW_NULL_ORIGIN must not be enabled in production');
+  if (env.PAYMONGO_WEBHOOK_TOLERANCE_SECONDS) {
+    const tolerance = Number(env.PAYMONGO_WEBHOOK_TOLERANCE_SECONDS);
+    if (!Number.isFinite(tolerance) || tolerance < 0) {
+      errors.push('PAYMONGO_WEBHOOK_TOLERANCE_SECONDS must be a non-negative number');
+    }
+  }
   return errors;
 }
 

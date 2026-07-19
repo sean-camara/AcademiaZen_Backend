@@ -25,6 +25,7 @@ Firebase ID tokens are verified server-side; most routes are authenticated and q
 - Direct coupon entitlement grants fail closed. The provider-verified coupon checkout path remains compatible.
 - Account deletion removes owned R2 objects before application records and Firebase identity. Object-store failure leaves the identity available for retry.
 - Provider calls have bounded abort timeouts; production startup validates required identity, database, push, origin, and HTTPS settings without printing values.
+- PayMongo signatures follow the documented `t`/`te`/`li` format, select the signature by event mode, compare the `timestamp.rawBody` HMAC in constant time, and reject deliveries outside a five-minute window. See [PayMongo webhook setup and security](https://docs.paymongo.com/docs/developer-tools-webhook-setup-management).
 - Mongoose automatic index creation is disabled in production.
 
 Never log bearer tokens, passwords, API/service-account/payment/storage keys, database URIs, signed URLs, full prompts/documents, payment details, or SSH material. Use pseudonymous user IDs only where operationally necessary.
