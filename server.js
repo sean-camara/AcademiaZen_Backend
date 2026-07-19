@@ -603,13 +603,13 @@ const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI ===
 const MAX_AI_PROMPT_CHARS = Number(process.env.MAX_AI_PROMPT_CHARS || 12000);
 const MAX_AI_PROMPT_CHARS_FREE = Number(process.env.MAX_AI_PROMPT_CHARS_FREE || 3000);
 const AI_BASE_URL = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
-const AI_MODEL_DEFAULT = process.env.AI_MODEL || 'deepseek/deepseek-r1-0528:free';
-const AI_MODEL_FAST = process.env.AI_MODEL_FAST || 'deepseek/deepseek-chat';
+const AI_MODEL_DEFAULT = process.env.AI_MODEL || 'deepseek/deepseek-v4-flash';
+const AI_MODEL_FAST = process.env.AI_MODEL_FAST || 'deepseek/deepseek-v4-flash';
 const AI_MODEL_DEEP = process.env.AI_MODEL_DEEP || AI_MODEL_DEFAULT;
 const AI_MODEL_FREE_FAST = process.env.AI_MODEL_FREE_FAST || AI_MODEL_FAST;
 const AI_MODEL_FREE_DEEP = process.env.AI_MODEL_FREE_DEEP || AI_MODEL_DEEP;
-const AI_MODEL_PREMIUM_FAST = process.env.AI_MODEL_PREMIUM_FAST || 'deepseek-chat';
-const AI_MODEL_PREMIUM_DEEP = process.env.AI_MODEL_PREMIUM_DEEP || 'deepseek-reasoner';
+const AI_MODEL_PREMIUM_FAST = process.env.AI_MODEL_PREMIUM_FAST || 'deepseek-v4-flash';
+const AI_MODEL_PREMIUM_DEEP = process.env.AI_MODEL_PREMIUM_DEEP || 'deepseek-v4-flash';
 const AI_MAX_TOKENS_FAST = Number(process.env.AI_MAX_TOKENS_FAST || 4096);
 const AI_MAX_TOKENS_DEEP = Number(process.env.AI_MAX_TOKENS_DEEP || 4096);
 const AI_MAX_TOKENS_FREE_FAST = Number(process.env.AI_MAX_TOKENS_FREE_FAST || 1600);
@@ -621,7 +621,7 @@ const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || 'AcademiaZen';
 // DeepSeek Direct API for AI Reviewer (separate from OpenRouter to control costs)
 const DEEPSEEK_REVIEWER_API_KEY = resolveEnvRef(process.env.DEEPSEEK_REVIEWER_API_KEY);
 const DEEPSEEK_REVIEWER_BASE_URL = process.env.DEEPSEEK_REVIEWER_BASE_URL || 'https://api.deepseek.com/v1';
-const DEEPSEEK_REVIEWER_MODEL = process.env.DEEPSEEK_REVIEWER_MODEL || 'deepseek-chat';
+const DEEPSEEK_REVIEWER_MODEL = process.env.DEEPSEEK_REVIEWER_MODEL || 'deepseek-v4-flash';
 
 const R2_ENDPOINT = process.env.R2_ENDPOINT || '';
 const R2_BUCKET = process.env.R2_BUCKET || '';

@@ -169,8 +169,8 @@ Express.js (REST API)
    OPENROUTER_API_KEY=sk-or-v1-xxxxx
    OPENROUTER_SITE_URL=https://yourdomain.com
    OPENROUTER_APP_TITLE=AcademiaZen
-   AI_MODEL_FAST=deepseek/deepseek-chat
-   AI_MODEL_DEEP=deepseek/deepseek-reasoner
+   AI_MODEL_FAST=deepseek/deepseek-v4-flash
+   AI_MODEL_DEEP=deepseek/deepseek-v4-flash
    ALLOW_FREE_AI=false
 
    # Billing (PayMongo)
