@@ -24,12 +24,36 @@ const { User, getDefaultState } = require('./models/User');
 const { FocusSession } = require('./models/FocusSession');
 const PushSubscription = require('./models/PushSubscription');
 const { AILog } = require('./models/AILog');
+const { acquireAIQuotaLock, releaseAIQuotaLock } = require('./services/aiQuotaLock');
+const { buildStateRevisionFilter, hasValidRevision } = require('./services/stateRevision');
 
 const app = express();
 
 // Trust proxy for rate limiting and correct IPs behind Nginx
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
+
+app.use((req, res, next) => {
+  const requestId = crypto.randomUUID();
+  const startedAt = process.hrtime.bigint();
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
+
+  res.on('finish', () => {
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+    console.log(JSON.stringify({
+      level: 'info',
+      event: 'http_request',
+      requestId,
+      method: req.method,
+      route: req.route?.path || 'unmatched',
+      status: res.statusCode,
+      durationMs: Math.round(durationMs * 100) / 100,
+    }));
+  });
+
+  next();
+});
 
 // ----- Security / middleware -----
 app.use(helmet({
@@ -89,11 +113,27 @@ const AI_LIMITS = {
  * Must be used AFTER requireAuth middleware
  */
 async function aiUsageGuard(req, res, next) {
+  let lockOwner = null;
+  let lockUid = null;
   try {
     const uid = req.user?.uid;
     if (!uid) {
       return res.status(401).json({ error: 'Authentication required' });
     }
+
+    const owner = req.requestId || crypto.randomUUID();
+    const acquired = await acquireAIQuotaLock(uid, owner);
+    if (!acquired) {
+      res.setHeader('Retry-After', '1');
+      return res.status(429).json({
+        error: 'quota_check_in_progress',
+        message: 'Another AI request is being checked. Please retry in a moment.',
+        requestId: req.requestId,
+        retryAfter: 1,
+      });
+    }
+    lockOwner = owner;
+    lockUid = uid;
 
     const user = await User.findOne({ uid });
     if (!user) {
@@ -262,11 +302,22 @@ async function aiUsageGuard(req, res, next) {
     // Save usage update
     await user.save();
 
-    next();
+    return next();
   } catch (err) {
     console.error('[aiUsageGuard] Error:', err);
-    // Don't block on guard errors - fail open but log
-    next();
+    return res.status(503).json({
+      error: 'quota_guard_unavailable',
+      message: 'AI usage could not be verified. Please try again shortly.',
+      requestId: req.requestId,
+    });
+  } finally {
+    if (lockUid && lockOwner) {
+      try {
+        await releaseAIQuotaLock(lockUid, lockOwner);
+      } catch (releaseError) {
+        console.error('[aiUsageGuard] Failed to release quota lock:', releaseError);
+      }
+    }
   }
 }
 
@@ -346,36 +397,30 @@ app.use(cors({
   credentials: true,
 }));
 
-// ----- Firebase Admin -----
-initFirebaseAdmin();
-
-// ----- MongoDB -----
+// ----- Infrastructure initialization -----
 const MONGODB_URI = process.env.MONGODB_URI;
-if (!MONGODB_URI) {
-  console.error('Missing MONGODB_URI in environment');
-  process.exit(1);
+
+async function initializeInfrastructure() {
+  initFirebaseAdmin();
+
+  if (!MONGODB_URI) {
+    throw new Error('Missing MONGODB_URI in environment');
+  }
+  if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
+    throw new Error('VAPID keys not found. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY.');
+  }
+
+  await mongoose.connect(MONGODB_URI, {
+    autoIndex: process.env.NODE_ENV !== 'production',
+  });
+  console.log(JSON.stringify({ level: 'info', event: 'mongodb_connected' }));
+
+  webpush.setVapidDetails(
+    process.env.VAPID_EMAIL || 'mailto:admin@academiazen.app',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
 }
-
-mongoose.connect(MONGODB_URI, {
-  autoIndex: true,
-}).then(() => {
-  console.log('MongoDB connected');
-}).catch(err => {
-  console.error('MongoDB connection error:', err);
-  process.exit(1);
-});
-
-// ----- Web Push -----
-if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
-  console.error('VAPID keys not found. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY.');
-  process.exit(1);
-}
-
-webpush.setVapidDetails(
-  process.env.VAPID_EMAIL || 'mailto:admin@academiazen.app',
-  process.env.VAPID_PUBLIC_KEY,
-  process.env.VAPID_PRIVATE_KEY
-);
 
 // ----- Helpers -----
 async function getOrCreateUser(uid, email) {
@@ -1013,6 +1058,18 @@ function isCheckoutPaid(checkout) {
 // Health check (public - for uptime monitoring, Docker, load balancers)
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.get('/live', (req, res) => {
+  res.json({ status: 'ok', requestId: req.requestId });
+});
+
+app.get('/ready', (req, res) => {
+  const ready = mongoose.connection.readyState === 1;
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not_ready',
+    requestId: req.requestId,
+  });
 });
 
 // Auth ping (public - for frontend to verify API is reachable)
@@ -1950,7 +2007,7 @@ app.get('/api/state', requireAuth, async (req, res) => {
     }
     
     console.log(`[SYNC] Returning state for ${req.user.email}: tasks=${user.state?.tasks?.length || 0}, subjects=${user.state?.subjects?.length || 0}`);
-    res.json({ state: user.state });
+    res.json({ state: user.state, revision: user.stateRevision || 0 });
   } catch (err) {
     console.error('Failed to get state:', err);
     res.status(500).json({ error: 'Failed to load state' });
@@ -1960,7 +2017,7 @@ app.get('/api/state', requireAuth, async (req, res) => {
 app.put('/api/state', requireAuth, async (req, res) => {
   console.log(`[SYNC] PUT /api/state from ${req.user.email}`);
   try {
-    const { state } = req.body;
+    const { state, baseRevision } = req.body;
     if (!isValidState(state)) {
       console.log(`[SYNC] Invalid state payload from ${req.user.email}`);
       return res.status(400).json({ error: 'Invalid state payload' });
@@ -2007,20 +2064,32 @@ app.put('/api/state', requireAuth, async (req, res) => {
     
     // Use findOneAndUpdate with $set to ensure the state is saved
     // This bypasses Mongoose's change detection which can be buggy with nested objects
+    const revisionProvided = hasValidRevision(baseRevision);
     const updateResult = await User.findOneAndUpdate(
-      { uid: req.user.uid },
+      buildStateRevisionFilter(req.user.uid, baseRevision),
       { 
         $set: { 
           state: sanitizedState,
           email: req.user.email || user.email
-        }
+        },
+        $inc: { stateRevision: 1 },
       },
       { new: true }
     );
+
+    if (!updateResult && revisionProvided) {
+      const current = await User.findOne({ uid: req.user.uid }).select('stateRevision').lean();
+      return res.status(409).json({
+        error: 'State changed in another session',
+        code: 'STATE_CONFLICT',
+        revision: current?.stateRevision || 0,
+        requestId: req.requestId,
+      });
+    }
     
     console.log(`[SYNC] SAVED for ${req.user.email}: tasks=${updateResult?.state?.tasks?.length || 0}, subjects=${updateResult?.state?.subjects?.length || 0}`);
     
-    res.json({ success: true });
+    res.json({ success: true, revision: updateResult?.stateRevision || 0 });
   } catch (err) {
     console.error('Failed to save state:', err);
     res.status(500).json({ error: 'Failed to save state' });
@@ -3414,15 +3483,21 @@ async function checkStudyReminders() {
 
 const TWO_HOURS = 2 * 60 * 60 * 1000;
 const TEN_MINUTES = 10 * 60 * 1000;
-setInterval(checkTaskDeadlines, TWO_HOURS);
-setInterval(checkDailyBriefings, TEN_MINUTES);
-setInterval(checkStudyReminders, TEN_MINUTES);
-setTimeout(checkTaskDeadlines, 30000);
-setTimeout(checkDailyBriefings, 30000);
-setTimeout(checkStudyReminders, 30000);
+
+function startBackgroundJobs() {
+  const timers = [
+    setInterval(checkTaskDeadlines, TWO_HOURS),
+    setInterval(checkDailyBriefings, TEN_MINUTES),
+    setInterval(checkStudyReminders, TEN_MINUTES),
+    setTimeout(checkTaskDeadlines, 30000),
+    setTimeout(checkDailyBriefings, 30000),
+    setTimeout(checkStudyReminders, 30000),
+  ];
+  return () => timers.forEach(clearTimeout);
+}
 
 // ----- 404 Handler (must be last) -----
-app.use('/api/*', (req, res) => {
+app.use('/api/{*path}', (req, res) => {
   res.status(404).json({ 
     error: 'Not Found', 
     message: `Endpoint ${req.method} ${req.originalUrl} does not exist`,
@@ -3439,6 +3514,62 @@ app.use('/api/*', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`AcademiaZen API listening on port ${PORT}`);
-});
+
+async function startServer() {
+  await initializeInfrastructure();
+  const stopBackgroundJobs = startBackgroundJobs();
+  const server = app.listen(PORT, () => {
+    console.log(JSON.stringify({ level: 'info', event: 'server_listening', port: Number(PORT) }));
+  });
+
+  const shutdown = async (signal = 'manual') => {
+    console.log(JSON.stringify({ level: 'info', event: 'shutdown_started', signal }));
+    stopBackgroundJobs();
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await mongoose.disconnect();
+    console.log(JSON.stringify({ level: 'info', event: 'shutdown_complete', signal }));
+  };
+
+  return { server, shutdown };
+}
+
+if (require.main === module) {
+  startServer()
+    .then(({ shutdown }) => {
+      let shuttingDown = false;
+      const handleSignal = async (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        try {
+          await shutdown(signal);
+          process.exitCode = 0;
+        } catch (error) {
+          console.error(JSON.stringify({
+            level: 'error',
+            event: 'shutdown_failed',
+            message: error instanceof Error ? error.message : 'Unknown shutdown error',
+          }));
+          process.exitCode = 1;
+        }
+      };
+      process.once('SIGTERM', () => void handleSignal('SIGTERM'));
+      process.once('SIGINT', () => void handleSignal('SIGINT'));
+    })
+    .catch((error) => {
+      console.error(JSON.stringify({
+        level: 'error',
+        event: 'startup_failed',
+        message: error instanceof Error ? error.message : 'Unknown startup error',
+      }));
+      process.exitCode = 1;
+    });
+}
+
+module.exports = {
+  app,
+  initializeInfrastructure,
+  startBackgroundJobs,
+  startServer,
+};
