@@ -15,10 +15,10 @@ Observed from `server.js` on 2026-07-19. Unless noted public, routes require a F
 | POST `/api/billing/auto-renew` | preference | Must not imply provider cancellation. |
 | POST `/api/billing/cancel` | cancel at period end | Server entitlement only. |
 | POST `/api/billing/checkout` | PayMongo checkout | Rate-limited; duplicate/idempotency handling required. |
-| POST `/api/billing/secret-checkout` | coupon/secret checkout | High-risk production attack surface; direct grant must be disabled. |
+| POST `/api/billing/secret-checkout` | coupon/secret checkout | Direct grants now fail closed; provider-verified checkout remains available. |
 | POST `/api/billing/extend` | extension checkout | Requires active non-renewing premium. |
 | POST `/api/billing/refresh` | reconcile pending checkout | External provider read and user update. |
-| POST `/api/billing/webhook/paymongo` | public signed webhook | Signature and event idempotency are critical. |
+| POST `/api/billing/webhook/paymongo` | public signed webhook | Signature verified; payment-key lock and processed-key history make paid-event replay idempotent. |
 | GET `/api/focus/summary` | target session summary | Query-scoped; validate target type/id. |
 | POST `/api/focus/sessions/start` | start session | Abandons other active sessions; duplicate start semantics needed. |
 | POST `/api/focus/sessions/end` | finish/partial session | Ownership query; repeat submission behavior needs idempotency. |
@@ -29,7 +29,7 @@ Observed from `server.js` on 2026-07-19. Unless noted public, routes require a F
 | GET `/api/focus/suggestions` | study suggestions | Reads embedded state and recent sessions. |
 | GET `/api/state` | current embedded state | Creates missing user/defaults. |
 | PUT `/api/state` | replace/sanitize state | Whole-document last-writer-wins; max size enforced. |
-| DELETE `/api/account` | delete account data | Multi-collection, non-transactional; Firebase identity/R2 objects not deleted. |
+| DELETE `/api/account` | delete account | Deletes owned R2 objects, application records, AI logs/quota state, then Firebase identity; retry-safe but not transactional across providers. |
 | POST `/api/subscribe` | upsert owned push subscription | Unique UID+endpoint. |
 | DELETE `/api/unsubscribe` | remove owned endpoint | Validate endpoint length/shape. |
 | GET `/api/subscriptions/count` | admin count | Email allowlist authorization. |

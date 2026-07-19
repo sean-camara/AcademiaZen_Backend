@@ -16,16 +16,33 @@ const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const webpush = require('web-push');
 const crypto = require('crypto');
-const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+} = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
-const { requireAuth, requireAdmin, initFirebaseAdmin } = require('./middleware/auth');
+const { requireAuth, requireAdmin, initFirebaseAdmin, deleteFirebaseUser } = require('./middleware/auth');
 const { User, getDefaultState } = require('./models/User');
 const { FocusSession } = require('./models/FocusSession');
 const PushSubscription = require('./models/PushSubscription');
 const { AILog } = require('./models/AILog');
+const { AIQuotaLock } = require('./models/AIQuotaLock');
 const { acquireAIQuotaLock, releaseAIQuotaLock } = require('./services/aiQuotaLock');
 const { buildStateRevisionFilter, hasValidRevision } = require('./services/stateRevision');
+const {
+  isBillingActive,
+  getBillingSnapshot,
+  getPaymentKey,
+  applyPaidSubscription,
+} = require('./services/billing');
+const { acquireBillingEventLock, releaseBillingEventLock } = require('./services/billingEventLock');
+const { deleteAccount } = require('./services/accountDeletion');
+const { assertProductionEnvironment } = require('./services/envValidation');
 
 const app = express();
 
@@ -401,6 +418,7 @@ app.use(cors({
 const MONGODB_URI = process.env.MONGODB_URI;
 
 async function initializeInfrastructure() {
+  assertProductionEnvironment();
   initFirebaseAdmin();
 
   if (!MONGODB_URI) {
@@ -611,6 +629,15 @@ const R2_PUBLIC_BASE_URL = process.env.R2_PUBLIC_BASE_URL || '';
 const R2_SIGNED_URL_TTL = Number(process.env.R2_SIGNED_URL_TTL || 900);
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 15 * 1024 * 1024);
 const MAX_PDF_TEXT_CHARS = Number(process.env.MAX_PDF_TEXT_CHARS || 12000);
+const EXTERNAL_REQUEST_TIMEOUT_MS = Number(process.env.EXTERNAL_REQUEST_TIMEOUT_MS || 60_000);
+const AI_STREAM_TIMEOUT_MS = Number(process.env.AI_STREAM_TIMEOUT_MS || 120_000);
+
+function fetchWithTimeout(url, options = {}, timeoutMs = EXTERNAL_REQUEST_TIMEOUT_MS) {
+  return fetch(url, {
+    ...options,
+    signal: options.signal || AbortSignal.timeout(timeoutMs),
+  });
+}
 
 let r2Client;
 function getR2Client() {
@@ -636,6 +663,29 @@ function ensureR2() {
     throw new Error('R2 is not configured');
   }
   return client;
+}
+
+async function deleteR2Prefix(uid) {
+  const client = getR2Client();
+  if (!client && !R2_BUCKET && !R2_ENDPOINT) return;
+  if (!client || !R2_BUCKET) throw new Error('R2 account deletion is not fully configured');
+
+  let continuationToken;
+  do {
+    const listed = await client.send(new ListObjectsV2Command({
+      Bucket: R2_BUCKET,
+      Prefix: `${uid}/`,
+      ContinuationToken: continuationToken,
+    }));
+    const objects = (listed.Contents || []).map(({ Key }) => ({ Key })).filter(({ Key }) => Key);
+    if (objects.length) {
+      await client.send(new DeleteObjectsCommand({
+        Bucket: R2_BUCKET,
+        Delete: { Objects: objects, Quiet: true },
+      }));
+    }
+    continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+  } while (continuationToken);
 }
 
 function isOwnedKey(key, uid) {
@@ -688,44 +738,6 @@ function getCheckoutUrls() {
   return {
     success: `${frontend.replace(/\/+$/, '')}/?billing=success`,
     cancel: `${frontend.replace(/\/+$/, '')}/?billing=cancel`,
-  };
-}
-
-function addInterval(date, interval) {
-  const next = new Date(date);
-  if (interval === 'weekly') {
-    next.setDate(next.getDate() + 7);
-  } else if (interval === 'yearly') {
-    next.setFullYear(next.getFullYear() + 1);
-  } else {
-    next.setMonth(next.getMonth() + 1);
-  }
-  return next;
-}
-
-function isBillingActive(billing) {
-  if (!billing?.currentPeriodEnd) return false;
-  const end = new Date(billing.currentPeriodEnd);
-  const status = billing?.status;
-  return (status === 'active' || status === 'canceled') && end.getTime() > Date.now();
-}
-
-function getBillingSnapshot(billing) {
-  const active = isBillingActive(billing);
-  const plan = billing?.plan || 'free';
-  const autoRenew = plan === 'premium' ? (billing?.autoRenew ?? true) : false;
-  let status = billing?.status || 'free';
-  if ((status === 'active' || status === 'canceled') && !active) status = 'expired';
-  if (status === 'pending' && !billing?.pendingCheckoutId) status = 'free';
-  return {
-    plan,
-    interval: billing?.interval || 'none',
-    status,
-    currentPeriodEnd: billing?.currentPeriodEnd ? new Date(billing.currentPeriodEnd).toISOString() : null,
-    autoRenew,
-    isActive: active,
-    effectivePlan: active ? plan : 'free',
-    pendingCheckoutId: billing?.pendingCheckoutId || '',
   };
 }
 
@@ -849,38 +861,6 @@ async function getFocusAnalytics(uid) {
   };
 }
 
-function applyPaidSubscription(user, interval, details = {}) {
-  if (!user.billing) user.billing = {};
-  if (!user.billing.paymongo) user.billing.paymongo = {};
-  const now = new Date();
-  const currentEnd = user.billing?.currentPeriodEnd ? new Date(user.billing.currentPeriodEnd) : null;
-  const base = currentEnd && currentEnd > now ? currentEnd : now;
-  const nextEnd = addInterval(base, interval);
-
-  user.billing.plan = 'premium';
-  user.billing.interval = interval;
-  user.billing.status = 'active';
-  user.billing.currentPeriodEnd = nextEnd;
-  user.billing.lastPaymentAt = now;
-  user.billing.pendingCheckoutId = '';
-  user.billing.pendingPlan = '';
-  user.billing.pendingInterval = '';
-
-  if (details.checkoutId) user.billing.paymongo.checkoutId = details.checkoutId;
-  if (details.paymentId) user.billing.paymongo.paymentId = details.paymentId;
-  if (details.paymentIntentId) user.billing.paymongo.paymentIntentId = details.paymentIntentId;
-  if (details.sourceId) user.billing.paymongo.sourceId = details.sourceId;
-  if (details.eventId) user.billing.paymongo.lastEventId = details.eventId;
-  if (details.eventType) user.billing.paymongo.lastEventType = details.eventType;
-
-  // Reset AI usage counters on subscription activation/renewal
-  if (!user.aiUsage) user.aiUsage = {};
-  user.aiUsage.dailyCount = 0;
-  user.aiUsage.monthlyCount = 0;
-  user.aiUsage.deepDailyCount = 0;
-  user.aiUsage.deepMonthlyCount = 0;
-}
-
 function buildPaymongoAuthHeader() {
   const token = Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64');
   return `Basic ${token}`;
@@ -891,7 +871,7 @@ async function paymongoRequest(path, { method = 'GET', body } = {}) {
     throw new Error('PAYMONGO_SECRET_KEY is not configured');
   }
 
-  const response = await fetch(`${PAYMONGO_API_BASE}${path}`, {
+  const response = await fetchWithTimeout(`${PAYMONGO_API_BASE}${path}`, {
     method,
     headers: {
       'Content-Type': 'application/json',
@@ -928,7 +908,7 @@ async function openrouterRequest(path, { method = 'POST', body } = {}) {
     headers['X-Title'] = OPENROUTER_APP_TITLE;
   }
 
-  const response = await fetch(`${AI_BASE_URL}${path}`, {
+  const response = await fetchWithTimeout(`${AI_BASE_URL}${path}`, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
@@ -951,7 +931,7 @@ async function deepseekReviewerRequest(messages, maxTokens = 8000) {
     throw new Error('DEEPSEEK_REVIEWER_API_KEY is not configured');
   }
 
-  const response = await fetch(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
+  const response = await fetchWithTimeout(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -981,7 +961,7 @@ async function deepseekChatRequest(model, messages, maxTokens = 1200, temperatur
     throw new Error('DEEPSEEK_REVIEWER_API_KEY is not configured');
   }
 
-  const response = await fetch(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
+  const response = await fetchWithTimeout(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1405,12 +1385,10 @@ app.post('/api/billing/secret-checkout', requireAuth, checkoutLimiter, async (re
     }
 
     if (BILLING_COUPON_DIRECT_GRANT) {
-      applyPaidSubscription(user, interval, {
-        eventType: 'coupon.grant',
-        eventId: `coupon-${Date.now()}`,
+      return res.status(503).json({
+        error: 'Direct coupon grants are disabled. Use provider-verified checkout.',
+        code: 'DIRECT_GRANT_DISABLED',
       });
-      await user.save();
-      return res.json({ direct: true, billing: getBillingSnapshot(user.billing) });
     }
 
     const { success, cancel } = getCheckoutUrls();
@@ -1571,7 +1549,11 @@ app.post('/api/billing/refresh', requireAuth, async (req, res) => {
     if (isCheckoutPaid(checkout)) {
       const interval = user.billing.pendingInterval || user.billing.interval || 'monthly';
       const paymentId = checkout?.data?.attributes?.payments?.[0]?.id;
-      applyPaidSubscription(user, interval, { checkoutId, paymentId });
+      applyPaidSubscription(user, interval, {
+        checkoutId,
+        paymentId,
+        eventType: 'checkout.refresh',
+      });
       await user.save();
       return res.json({ updated: true, billing: getBillingSnapshot(user.billing || {}) });
     }
@@ -1936,6 +1918,7 @@ app.get('/api/focus/suggestions', requireAuth, async (req, res) => {
 });
 
 app.post('/api/billing/webhook/paymongo', async (req, res) => {
+  let lock;
   try {
     if (!verifyPaymongoSignature(req)) {
       return res.status(400).json({ error: 'Invalid signature' });
@@ -1946,15 +1929,26 @@ app.post('/api/billing/webhook/paymongo', async (req, res) => {
     const eventId = event?.id;
     const resource = event?.attributes?.data;
     const checkoutId = resource?.id;
+    const paymentId = resource?.attributes?.payments?.[0]?.id;
 
     if (!eventType || !checkoutId) {
       return res.json({ received: true });
+    }
+
+    const paymentKey = getPaymentKey({ paymentId, eventId, checkoutId, eventType });
+    const lockOwner = req.requestId || crypto.randomUUID();
+    if (String(eventType).includes('payment.') && paymentKey) {
+      const acquired = await acquireBillingEventLock(paymentKey, lockOwner);
+      if (!acquired) return res.json({ received: true, duplicate: true });
+      lock = { key: paymentKey, owner: lockOwner };
     }
 
     const user = await User.findOne({ 'billing.pendingCheckoutId': checkoutId })
       || await User.findOne({ 'billing.paymongo.checkoutId': checkoutId });
 
     if (!user) {
+      if (lock) await releaseBillingEventLock(lock.key, lock.owner);
+      lock = null;
       return res.json({ received: true });
     }
     if (!user.billing) user.billing = {};
@@ -1962,8 +1956,13 @@ app.post('/api/billing/webhook/paymongo', async (req, res) => {
 
     if (String(eventType).includes('payment.paid')) {
       const interval = user.billing.pendingInterval || user.billing.interval || 'monthly';
-      const paymentId = resource?.attributes?.payments?.[0]?.id;
-      applyPaidSubscription(user, interval, { checkoutId, paymentId, eventId, eventType });
+      applyPaidSubscription(user, interval, {
+        checkoutId,
+        paymentId,
+        eventId,
+        eventType,
+        paymentKey,
+      });
       await user.save();
     } else if (String(eventType).includes('payment.failed')) {
       user.billing.status = 'past_due';
@@ -1972,8 +1971,14 @@ app.post('/api/billing/webhook/paymongo', async (req, res) => {
       await user.save();
     }
 
+    if (lock) await releaseBillingEventLock(lock.key, lock.owner);
+    lock = null;
+
     res.json({ received: true });
   } catch (err) {
+    if (lock) {
+      await releaseBillingEventLock(lock.key, lock.owner).catch(() => {});
+    }
     console.error('PayMongo webhook failed:', err);
     res.status(500).json({ error: 'Webhook handling failed' });
   }
@@ -2098,11 +2103,20 @@ app.put('/api/state', requireAuth, async (req, res) => {
 
 app.delete('/api/account', requireAuth, async (req, res) => {
   try {
-    await Promise.all([
-      User.deleteOne({ uid: req.user.uid }),
-      PushSubscription.deleteMany({ uid: req.user.uid }),
-      FocusSession.deleteMany({ uid: req.user.uid }),
-    ]);
+    await deleteAccount({
+      uid: req.user.uid,
+      deleteObjects: deleteR2Prefix,
+      deleteDocuments: async (uid) => {
+        await Promise.all([
+          User.deleteOne({ uid }),
+          PushSubscription.deleteMany({ uid }),
+          FocusSession.deleteMany({ uid }),
+          AILog.deleteMany({ uid }),
+          AIQuotaLock.deleteOne({ _id: uid }),
+        ]);
+      },
+      deleteIdentity: deleteFirebaseUser,
+    });
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to delete account data:', err);
@@ -2623,7 +2637,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
       const selectedModel = isDeep ? AI_MODEL_PREMIUM_DEEP : AI_MODEL_PREMIUM_FAST;
       const maxTokens = isDeep ? AI_MAX_TOKENS_DEEP : AI_MAX_TOKENS_FAST;
       
-      const response = await fetch(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
+      const response = await fetchWithTimeout(`${DEEPSEEK_REVIEWER_BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2636,7 +2650,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
           messages,
           stream: true,
         }),
-      });
+      }, AI_STREAM_TIMEOUT_MS);
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -2692,7 +2706,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
       if (OPENROUTER_SITE_URL) headers['HTTP-Referer'] = OPENROUTER_SITE_URL;
       if (OPENROUTER_APP_TITLE) headers['X-Title'] = OPENROUTER_APP_TITLE;
 
-      const response = await fetch(`${AI_BASE_URL}/chat/completions`, {
+      const response = await fetchWithTimeout(`${AI_BASE_URL}/chat/completions`, {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -2702,7 +2716,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
           messages,
           stream: true,
         }),
-      });
+      }, AI_STREAM_TIMEOUT_MS);
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));

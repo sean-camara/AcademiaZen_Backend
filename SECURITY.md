@@ -18,6 +18,15 @@ Firebase ID tokens are verified server-side; most routes are authenticated and q
 | Medium | Raw errors/log calls are inconsistent | Structured redacted logger; stable error envelope; no stack/provider details in production. |
 | Medium | `autoIndex: true` runs index work at application startup | Disable in production after explicit index migration/verification. |
 
+## Modernization controls implemented
+
+- AI quota mutation is serialized per user and fails closed when its lock store is unavailable.
+- Paid events use a provider payment ID (event/checkout fallback), a database-backed concurrency lock, and a bounded durable processed-key history. Replaying the same payment no longer extends entitlement.
+- Direct coupon entitlement grants fail closed. The provider-verified coupon checkout path remains compatible.
+- Account deletion removes owned R2 objects before application records and Firebase identity. Object-store failure leaves the identity available for retry.
+- Provider calls have bounded abort timeouts; production startup validates required identity, database, push, origin, and HTTPS settings without printing values.
+- Mongoose automatic index creation is disabled in production.
+
 Never log bearer tokens, passwords, API/service-account/payment/storage keys, database URIs, signed URLs, full prompts/documents, payment details, or SSH material. Use pseudonymous user IDs only where operationally necessary.
 
 Security changes that affect SSH, firewall, TLS, billing, credentials, or data require explicit production authority, backup, rollback, and independent verification.

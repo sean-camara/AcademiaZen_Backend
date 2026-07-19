@@ -151,6 +151,7 @@ const BillingSchema = new mongoose.Schema({
     sourceId: { type: String, default: '' },
     lastEventId: { type: String, default: '' },
     lastEventType: { type: String, default: '' },
+    processedPaymentKeys: { type: [String], default: [] },
   },
 }, { _id: false });
 

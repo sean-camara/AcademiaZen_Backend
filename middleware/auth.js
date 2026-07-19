@@ -41,6 +41,14 @@ async function requireAuth(req, res, next) {
   }
 }
 
+async function deleteFirebaseUser(uid) {
+  try {
+    await admin.auth().deleteUser(uid);
+  } catch (error) {
+    if (error?.code !== 'auth/user-not-found') throw error;
+  }
+}
+
 function requireAdmin(req, res, next) {
   const adminList = (process.env.ADMIN_EMAILS || '')
     .split(',')
@@ -58,4 +66,5 @@ module.exports = {
   initFirebaseAdmin,
   requireAuth,
   requireAdmin,
+  deleteFirebaseUser,
 };
