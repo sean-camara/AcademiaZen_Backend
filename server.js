@@ -2317,7 +2317,8 @@ function buildZenSystemPrompt(user, hasPremium) {
   if (overdueTasks.length > 0) {
     const overdueList = overdueTasks.map(t => {
       const subj = t.subjectId ? subjectMap.get(t.subjectId) : null;
-      return subj ? `"${t.title}" (${subj})` : `"${t.title}"`;
+      const category = t.category || 'task';
+      return subj ? `"${t.title}" [${category}] (${subj})` : `"${t.title}" [${category}]`;
     }).join(', ');
     contextSections.push(`⚠️ OVERDUE tasks: ${overdueList}. Gently remind them if relevant.`);
   }
@@ -2325,10 +2326,12 @@ function buildZenSystemPrompt(user, hasPremium) {
   if (upcomingTasks.length > 0) {
     const upcomingList = upcomingTasks.map(t => {
       const subj = t.subjectId ? subjectMap.get(t.subjectId) : null;
+      const category = t.category || 'task';
       const due = new Date(t.dueDate);
       const daysUntil = Math.ceil((due - now) / (1000 * 60 * 60 * 24));
       const dueLabel = daysUntil === 0 ? 'today' : daysUntil === 1 ? 'tomorrow' : `in ${daysUntil} days`;
-      return subj ? `"${t.title}" (${subj}, due ${dueLabel})` : `"${t.title}" (due ${dueLabel})`;
+      const scheduledTime = due.toLocaleString();
+      return subj ? `"${t.title}" [${category}] (${subj}, due ${dueLabel}, scheduled ${scheduledTime})` : `"${t.title}" [${category}] (due ${dueLabel}, scheduled ${scheduledTime})`;
     }).join(', ');
     contextSections.push(`Upcoming tasks: ${upcomingList}.`);
   }
@@ -2367,6 +2370,7 @@ CAPABILITIES - You can help with:
 RESPONSE GUIDELINES:
 - Be direct and get to the point - students are busy
 - If asked about their tasks/deadlines, reference the context provided
+- Treat exam, project, study, and event entries as intentional calendar plans; use their scheduled date/time and subject when helping prioritize or build a study plan
 - If you don't know something, say so honestly
 - Keep responses focused but thorough - quality over quantity
 

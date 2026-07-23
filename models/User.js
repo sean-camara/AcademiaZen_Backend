@@ -16,6 +16,7 @@ const TaskSchema = new mongoose.Schema({
   dueDate: { type: String, default: '' },
   completed: { type: Boolean, default: false },
   subjectId: { type: String, default: '' },
+  category: { type: String, enum: ['task', 'exam', 'project', 'study', 'event'], default: 'task' },
   notes: { type: String, default: '' },
   pdfAttachment: { type: PdfAssetSchema, default: null },
 }, { _id: false });
