@@ -6,7 +6,33 @@ const { AILog } = require('../models/AILog');
 const Announcement = require('../models/Announcement');
 const Feedback = require('../models/Feedback');
 const SystemSetting = require('../models/SystemSetting');
+const { AdminAuditLog } = require('../models/AdminAuditLog');
 const router = express.Router();
+
+function escapeRegex(str) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function sanitizeText(str) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/</g, '&lt;').replace(/>/g, '&gt;').trim();
+}
+
+async function logAdminAction(req, action, targetUid = null, details = {}) {
+  try {
+    await AdminAuditLog.create({
+      adminUid: req.user?.uid || 'system',
+      adminEmail: req.user?.email || 'admin@academiazen.com',
+      action,
+      targetUid,
+      details,
+      ipAddress: req.ip || req.socket?.remoteAddress || '',
+    });
+  } catch (err) {
+    console.warn('[logAdminAction] Warning: Failed to record audit log:', err);
+  }
+}
 
 // Public / Authenticated User helper routes
 router.get('/api/me/role', requireAuth, async (req, res) => {
@@ -29,7 +55,6 @@ router.get('/api/me/role', requireAuth, async (req, res) => {
 
 router.get('/api/announcements/active', async (req, res) => {
   try {
-    const Announcement = require('../models/Announcement');
     const announcements = await Announcement.find({ isActive: true }).sort({ createdAt: -1 }).limit(3).lean();
     res.json({ announcements: announcements || [] });
   } catch (err) {
@@ -90,30 +115,34 @@ router.get('/api/admin/overview', async (req, res) => {
     ]);
     const totalFocusMinutes = Math.round((focusAgg[0]?.totalSeconds || 0) / 60);
 
-    // Calculate 7-day activity telemetry
+    // Calculate 7-day activity telemetry in parallel
     const now = new Date();
-    const dailyStats = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(now.getDate() - i);
-      const dateStr = d.toISOString().split('T')[0];
-      const dayName = d.toLocaleDateString('en-US', { weekday: 'short' });
+    const daysIndices = [6, 5, 4, 3, 2, 1, 0];
+    const dailyStats = await Promise.all(
+      daysIndices.map(async (i) => {
+        const d = new Date(now);
+        d.setDate(now.getDate() - i);
+        const dateStr = d.toISOString().split('T')[0];
+        const dayName = d.toLocaleDateString('en-US', { weekday: 'short' });
 
-      const dayActiveUsers = await User.countDocuments({ 'state.updatedAt': { $regex: `^${dateStr}` } });
-      const dayAiRequests = await AILog.countDocuments({
-        createdAt: {
-          $gte: new Date(dateStr + 'T00:00:00Z'),
-          $lte: new Date(dateStr + 'T23:59:59Z'),
-        },
-      });
+        const [dayActiveUsers, dayAiRequests] = await Promise.all([
+          User.countDocuments({ 'state.updatedAt': { $regex: `^${dateStr}` } }),
+          AILog.countDocuments({
+            createdAt: {
+              $gte: new Date(dateStr + 'T00:00:00Z'),
+              $lte: new Date(dateStr + 'T23:59:59Z'),
+            },
+          }),
+        ]);
 
-      dailyStats.push({
-        date: dateStr,
-        dayName,
-        activeUsers: dayActiveUsers,
-        aiRequests: dayAiRequests,
-      });
-    }
+        return {
+          date: dateStr,
+          dayName,
+          activeUsers: dayActiveUsers,
+          aiRequests: dayAiRequests,
+        };
+      })
+    );
 
     // Recent activity feed
     const recentUsers = await User.find()
@@ -137,6 +166,10 @@ router.get('/api/admin/overview', async (req, res) => {
       { $sort: { count: -1 } },
       { $limit: 4 },
     ]);
+
+    const monthlySubs = await User.countDocuments({ 'billing.plan': 'premium', 'billing.interval': 'monthly', 'billing.status': 'active' });
+    const weeklySubs = await User.countDocuments({ 'billing.plan': 'premium', 'billing.interval': 'weekly', 'billing.status': 'active' });
+    const estimatedMRR = (monthlySubs * 149) + (weeklySubs * 196); // 49/wk ~ 196/mo
 
     const conversionRate = totalUsers > 0 ? Math.round((premiumUsers / totalUsers) * 1000) / 10 : 0;
 
@@ -164,22 +197,28 @@ router.get('/api/admin/overview', async (req, res) => {
 // 2. User Directory & RBAC
 router.get('/api/admin/users', async (req, res) => {
   try {
-    const { q, role, plan, page = 1, limit = 20 } = req.query;
+    const { q, role, plan, status, page = 1, limit = 20 } = req.query;
     const filter = {};
 
     if (q) {
+      const cleanQ = escapeRegex(String(q));
       filter.$or = [
-        { email: { $regex: String(q), $options: 'i' } },
-        { uid: { $regex: String(q), $options: 'i' } },
-        { 'state.profile.firstName': { $regex: String(q), $options: 'i' } },
-        { 'state.profile.lastName': { $regex: String(q), $options: 'i' } },
+        { email: { $regex: cleanQ, $options: 'i' } },
+        { uid: { $regex: cleanQ, $options: 'i' } },
+        { 'state.profile.firstName': { $regex: cleanQ, $options: 'i' } },
+        { 'state.profile.lastName': { $regex: cleanQ, $options: 'i' } },
       ];
     }
-    if (role && ['user', 'admin'].includes(role)) {
+    if (role && ['user', 'admin'].includes(String(role))) {
       filter.role = role;
     }
-    if (plan && ['free', 'premium'].includes(plan)) {
+    if (plan && ['free', 'premium'].includes(String(plan))) {
       filter['billing.plan'] = plan;
+    }
+    if (status === 'suspended') {
+      filter.isSuspended = true;
+    } else if (status === 'active') {
+      filter.isSuspended = { $ne: true };
     }
 
     const skip = (Math.max(1, Number(page)) - 1) * Number(limit);
@@ -187,7 +226,7 @@ router.get('/api/admin/users', async (req, res) => {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(Number(limit))
-      .select('uid email role billing aiUsage createdAt updatedAt state.profile')
+      .select('uid email role isSuspended billing aiUsage createdAt updatedAt state.profile state.subjects state.tasks')
       .lean();
 
     const total = await User.countDocuments(filter);
@@ -197,10 +236,13 @@ router.get('/api/admin/users', async (req, res) => {
       email: u.email || 'N/A',
       name: `${u.state?.profile?.firstName || ''} ${u.state?.profile?.lastName || ''}`.trim() || 'Student',
       role: u.role || 'user',
+      isSuspended: Boolean(u.isSuspended),
       plan: u.billing?.plan || 'free',
       billingStatus: u.billing?.status || 'free',
       dailyAiCount: u.aiUsage?.dailyCount || 0,
       totalAiRequests: u.aiUsage?.totalRequests || 0,
+      subjectCount: u.state?.subjects?.length || 0,
+      taskCount: u.state?.tasks?.length || 0,
       createdAt: u.createdAt,
       lastActive: u.updatedAt,
     }));
@@ -212,6 +254,40 @@ router.get('/api/admin/users', async (req, res) => {
   }
 });
 
+// Stream CSV Export for Users
+router.get('/api/admin/users/export', async (req, res) => {
+  try {
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="academiazen_users.csv"');
+    res.write('UID,Email,Role,Plan,Status,Suspended,DailyAICount,TotalAIRequests,JoinedDate\n');
+
+    const cursor = User.find()
+      .sort({ createdAt: -1 })
+      .select('uid email role isSuspended billing aiUsage createdAt')
+      .cursor();
+
+    for (let u = await cursor.next(); u != null; u = await cursor.next()) {
+      const email = (u.email || '').replace(/"/g, '""');
+      const role = u.role || 'user';
+      const plan = u.billing?.plan || 'free';
+      const status = u.billing?.status || 'free';
+      const suspended = u.isSuspended ? 'YES' : 'NO';
+      const dailyCount = u.aiUsage?.dailyCount || 0;
+      const totalCount = u.aiUsage?.totalRequests || 0;
+      const date = u.createdAt ? new Date(u.createdAt).toISOString() : '';
+
+      res.write(`"${u.uid}","${email}","${role}","${plan}","${status}","${suspended}",${dailyCount},${totalCount},"${date}"\n`);
+    }
+
+    res.end();
+  } catch (err) {
+    console.error('Failed to export users CSV:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to export users CSV' });
+    }
+  }
+});
+
 router.post('/api/admin/users/:uid/role', async (req, res) => {
   try {
     const { role } = req.body || {};
@@ -219,13 +295,21 @@ router.post('/api/admin/users/:uid/role', async (req, res) => {
       return res.status(400).json({ error: 'Role must be user or admin' });
     }
 
+    if (req.params.uid === req.user.uid && role !== 'admin') {
+      return res.status(400).json({ error: 'You cannot revoke your own administrator role' });
+    }
+
     const user = await User.findOne({ uid: req.params.uid });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    const previousRole = user.role;
     user.role = role;
     await user.save();
+
+    await logAdminAction(req, 'UPDATE_ROLE', user.uid, { previousRole, newRole: role });
+
     res.json({ success: true, uid: user.uid, role: user.role });
   } catch (err) {
     console.error('Failed to set user role:', err);
@@ -247,6 +331,7 @@ router.post('/api/admin/users/:uid/plan', async (req, res) => {
 
     if (!user.billing) user.billing = {};
 
+    const previousPlan = user.billing.plan;
     if (plan === 'free') {
       user.billing.plan = 'free';
       user.billing.status = 'free';
@@ -262,10 +347,40 @@ router.post('/api/admin/users/:uid/plan', async (req, res) => {
     }
 
     await user.save();
+    await logAdminAction(req, 'UPDATE_PLAN', user.uid, { previousPlan, newPlan: plan, interval, days });
+
     res.json({ success: true, uid: user.uid, billing: user.billing });
   } catch (err) {
     console.error('Failed to set user plan:', err);
     res.status(500).json({ error: 'Failed to set user plan' });
+  }
+});
+
+router.post('/api/admin/users/:uid/suspend', async (req, res) => {
+  try {
+    const { suspend } = req.body || {};
+    if (typeof suspend !== 'boolean') {
+      return res.status(400).json({ error: 'suspend parameter must be a boolean' });
+    }
+
+    if (req.params.uid === req.user.uid && suspend) {
+      return res.status(400).json({ error: 'You cannot suspend your own active administrator account' });
+    }
+
+    const user = await User.findOne({ uid: req.params.uid });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    user.isSuspended = suspend;
+    await user.save();
+
+    await logAdminAction(req, suspend ? 'SUSPEND_USER' : 'UNSUSPEND_USER', user.uid, { email: user.email });
+
+    res.json({ success: true, uid: user.uid, isSuspended: user.isSuspended });
+  } catch (err) {
+    console.error('Failed to suspend user:', err);
+    res.status(500).json({ error: 'Failed to update user suspension status' });
   }
 });
 
@@ -281,6 +396,8 @@ router.post('/api/admin/users/:uid/reset-ai', async (req, res) => {
     user.aiUsage.cooldownUntil = null;
     user.aiUsage.requestsThisMinute = 0;
     await user.save();
+
+    await logAdminAction(req, 'RESET_AI_QUOTA', user.uid, { email: user.email });
 
     res.json({ success: true, message: 'AI quotas successfully reset for user' });
   } catch (err) {
@@ -325,17 +442,41 @@ router.get('/api/admin/analytics/academics', async (req, res) => {
 // 4. AI Request Logs
 router.get('/api/admin/ai/logs', async (req, res) => {
   try {
-    const { page = 1, limit = 30 } = req.query;
+    const { status, endpoint, page = 1, limit = 30 } = req.query;
+    const filter = {};
+    if (status === 'success') filter.success = true;
+    if (status === 'failed') filter.success = false;
+    if (endpoint) filter.endpoint = String(endpoint);
+
     const skip = (Math.max(1, Number(page)) - 1) * Number(limit);
 
-    const logs = await AILog.find()
+    const logs = await AILog.find(filter)
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(Number(limit))
       .lean();
 
-    const total = await AILog.countDocuments();
-    res.json({ logs, total, page: Number(page) });
+    const total = await AILog.countDocuments(filter);
+
+    // Summary Telemetry
+    const stats = await AILog.aggregate([
+      { $match: filter },
+      {
+        $group: {
+          _id: null,
+          avgTokens: { $avg: '$totalTokens' },
+          avgLatency: { $avg: '$responseTimeMs' },
+          failedCount: { $sum: { $cond: [{ $eq: ['$success', false] }, 1, 0] } },
+          totalCount: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const avgLatency = Math.round(stats[0]?.avgLatency || 0);
+    const avgTokens = Math.round(stats[0]?.avgTokens || 0);
+    const errorRate = stats[0]?.totalCount ? Math.round((stats[0].failedCount / stats[0].totalCount) * 1000) / 10 : 0;
+
+    res.json({ logs, total, page: Number(page), avgLatency, avgTokens, errorRate });
   } catch (err) {
     console.error('Failed to load AI logs:', err);
     res.status(500).json({ error: 'Failed to load AI logs' });
@@ -385,16 +526,20 @@ router.get('/api/admin/announcements', async (req, res) => {
 router.post('/api/admin/announcements', async (req, res) => {
   try {
     const { title, message, type = 'info' } = req.body || {};
-    if (!title || !message) {
+    const cleanTitle = sanitizeText(title);
+    const cleanMessage = sanitizeText(message);
+    if (!cleanTitle || !cleanMessage) {
       return res.status(400).json({ error: 'Title and message are required' });
     }
 
     const announcement = await Announcement.create({
-      title,
-      message,
+      title: cleanTitle,
+      message: cleanMessage,
       type,
       createdBy: req.user.email || req.user.uid,
     });
+
+    await logAdminAction(req, 'CREATE_ANNOUNCEMENT', null, { title: cleanTitle, type });
 
     res.json({ success: true, announcement });
   } catch (err) {
@@ -406,6 +551,8 @@ router.post('/api/admin/announcements', async (req, res) => {
 router.delete('/api/admin/announcements/:id', async (req, res) => {
   try {
     await Announcement.deleteOne({ _id: req.params.id });
+    await logAdminAction(req, 'DELETE_ANNOUNCEMENT', null, { id: req.params.id });
+
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to delete announcement:', err);
@@ -427,7 +574,8 @@ router.get('/api/admin/feedback', async (req, res) => {
 router.post('/api/admin/feedback/:id/reply', async (req, res) => {
   try {
     const { reply, status = 'resolved' } = req.body || {};
-    if (!reply) {
+    const cleanReply = sanitizeText(reply);
+    if (!cleanReply) {
       return res.status(400).json({ error: 'Reply text is required' });
     }
 
@@ -436,11 +584,13 @@ router.post('/api/admin/feedback/:id/reply', async (req, res) => {
       return res.status(404).json({ error: 'Feedback ticket not found' });
     }
 
-    item.reply = reply;
+    item.reply = cleanReply;
     item.status = status;
     item.repliedAt = new Date();
     item.repliedBy = req.user.email || req.user.uid;
     await item.save();
+
+    await logAdminAction(req, 'REPLY_FEEDBACK', item.uid, { ticketId: item._id, reply: cleanReply });
 
     res.json({ success: true, feedback: item });
   } catch (err) {
@@ -449,7 +599,18 @@ router.post('/api/admin/feedback/:id/reply', async (req, res) => {
   }
 });
 
-// 8. System Health
+// 8. Admin Audit Trail Logs
+router.get('/api/admin/audit-logs', async (req, res) => {
+  try {
+    const logs = await AdminAuditLog.find().sort({ createdAt: -1 }).limit(50).lean();
+    res.json({ logs });
+  } catch (err) {
+    console.error('Failed to load audit logs:', err);
+    res.status(500).json({ error: 'Failed to load audit logs' });
+  }
+});
+
+// 9. System Health
 router.get('/api/admin/health', async (req, res) => {
   try {
     const dbState = require('mongoose').connection.readyState;
@@ -490,10 +651,85 @@ router.post('/api/admin/maintenance', async (req, res) => {
       { upsert: true, new: true }
     );
 
+    await logAdminAction(req, enabled ? 'ENABLE_MAINTENANCE' : 'DISABLE_MAINTENANCE', null, { enabled });
+
     res.json({ success: true, maintenanceMode: enabled });
   } catch (err) {
     console.error('Failed to update maintenance mode:', err);
     res.status(500).json({ error: 'Failed to update maintenance mode' });
+  }
+});
+
+// Batch User Actions
+router.post('/api/admin/users/batch', async (req, res) => {
+  try {
+    const { uids, action, value } = req.body || {};
+    if (!Array.isArray(uids) || uids.length === 0) {
+      return res.status(400).json({ error: 'uids array is required' });
+    }
+
+    // Exclude current logged-in admin UID from batch suspension
+    const targetUids = action === 'suspend' ? uids.filter((id) => id !== req.user.uid) : uids;
+    if (action === 'suspend' && targetUids.length === 0) {
+      return res.status(400).json({ error: 'You cannot suspend your own active administrator account' });
+    }
+
+    if (action === 'grant_plan') {
+      await User.updateMany(
+        { uid: { $in: targetUids } },
+        {
+          $set: {
+            'billing.plan': 'premium',
+            'billing.status': 'active',
+            'billing.interval': 'monthly',
+            'billing.currentPeriodEnd': new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          },
+        }
+      );
+    } else if (action === 'reset_ai') {
+      await User.updateMany(
+        { uid: { $in: targetUids } },
+        { $set: { 'aiUsage.dailyCount': 0, 'aiUsage.cooldownUntil': null } }
+      );
+    } else if (action === 'suspend') {
+      await User.updateMany({ uid: { $in: targetUids } }, { $set: { isSuspended: true } });
+    } else if (action === 'unsuspend') {
+      await User.updateMany({ uid: { $in: targetUids } }, { $set: { isSuspended: false } });
+    } else {
+      return res.status(400).json({ error: 'Invalid batch action' });
+    }
+
+    await logAdminAction(req, `BATCH_${action.toUpperCase()}`, null, { count: targetUids.length, uids: targetUids });
+    res.json({ success: true, count: targetUids.length });
+  } catch (err) {
+    console.error('Failed to run batch action:', err);
+    res.status(500).json({ error: 'Failed to run batch action' });
+  }
+});
+
+// System Health Diagnostics with Collection Counts
+router.get('/api/admin/health/db-stats', async (req, res) => {
+  try {
+    const userCount = await User.countDocuments();
+    const focusCount = await FocusSession.countDocuments();
+    const aiLogCount = await AILog.countDocuments();
+    const annCount = await Announcement.countDocuments();
+    const fbCount = await Feedback.countDocuments();
+    const auditCount = await AdminAuditLog.countDocuments();
+
+    res.json({
+      collections: {
+        users: userCount,
+        focusSessions: focusCount,
+        aiLogs: aiLogCount,
+        announcements: annCount,
+        feedback: fbCount,
+        auditLogs: auditCount,
+      },
+    });
+  } catch (err) {
+    console.error('Failed db stats:', err);
+    res.status(500).json({ error: 'Failed db stats' });
   }
 });
 
