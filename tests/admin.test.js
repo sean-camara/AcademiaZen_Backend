@@ -18,6 +18,22 @@ describe('Admin RBAC API endpoints', () => {
     expect(response.body.error).toBe('Missing auth token');
   });
 
+  it('rejects unauthenticated audit logs requests with 401', async () => {
+    const response = await request(app)
+      .get('/api/admin/audit-logs')
+      .expect(401);
+
+    expect(response.body.error).toBe('Missing auth token');
+  });
+
+  it('rejects unauthenticated user export requests with 401', async () => {
+    const response = await request(app)
+      .get('/api/admin/users/export')
+      .expect(401);
+
+    expect(response.body.error).toBe('Missing auth token');
+  });
+
   it('allows fetching active public announcements without auth', async () => {
     const response = await request(app)
       .get('/api/announcements/active')

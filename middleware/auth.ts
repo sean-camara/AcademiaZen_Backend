@@ -50,6 +50,19 @@ function createRequireAuth(
         emailVerified: Boolean(decoded.email_verified),
         ...(isAdmin ? { isAdminClaim: true } : {}),
       };
+
+      if (req.user?.uid) {
+        try {
+          const { User } = require('../models/User');
+          const dbUser = await User.findOne({ uid: req.user.uid }).select('isSuspended').lean();
+          if (dbUser && dbUser.isSuspended) {
+            return res.status(403).json({ error: 'Account suspended by administrator' });
+          }
+        } catch {
+          // Non-blocking fallback
+        }
+      }
+
       next();
     } catch {
       return res.status(401).json({ error: 'Invalid auth token' });
