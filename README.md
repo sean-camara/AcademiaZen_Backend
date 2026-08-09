@@ -743,7 +743,7 @@ curl -I https://cluster0.mongodb.net
 
 ## 📄 License
 
-See root LICENSE file.
+No license file is currently included. All rights are reserved unless a license is added later.
 
 ## 🤝 Contributing
 
@@ -755,10 +755,8 @@ For deployment issues, see:
 - `/DEPLOYMENT_GUIDE.md` - Production deployment
 - `/VPS_SETUP.md` - Server configuration
 - Frontend README for client-side setup
-  "endpoint": "https://fcm.googleapis.com/fcm/send/...",
-  "userId": "optional-user-id"
-}
-```
+
+## Additional Push Notification Endpoints
 
 ### POST `/api/send-notification` (auth required)
 Send a push notification.
@@ -829,3 +827,27 @@ See the `AcademiaZen/utils/pushNotifications.ts` for the frontend implementation
 | `R2_ACCESS_KEY_ID` | R2 access key ID | Yes |
 | `R2_SECRET_ACCESS_KEY` | R2 secret access key | Yes |
 | `R2_PUBLIC_BASE_URL` | Optional public base URL | No |
+
+## Project Screenshot
+
+![AcademiaZen student dashboard](https://raw.githubusercontent.com/sean-camara/sean-camara-portfolio/main/public/assets/academiazen-screenshot.png)
+
+## Testing Strategy
+
+Vitest suites cover authentication, environment validation, application startup, billing and signatures, AI quotas and logs, account deletion, and state revisions. Run `npm run typecheck`, `npm run test:run`, and `npm run build` with test-only configuration. `npm run test:coverage` can generate a report, but no coverage percentage is published. Hosted storage, push, AI, and payment-provider contract tests remain environment-dependent.
+
+## Deployment Summary
+
+The TypeScript service builds to `dist/` and runs with `npm start`. Docker and root deployment documents cover the production topology. Store MongoDB, Firebase, R2, PayMongo, push, and AI credentials only in the deployment secret store; never commit populated environment files.
+
+## Known Limitations
+
+- Full provider verification requires separately approved sandbox or staging services.
+- Operational guidance assumes the documented Docker/VPS environment.
+- Rolling frontend/backend compatibility must be checked before release.
+
+## Future Improvements
+
+- Add isolated provider-contract and failure-recovery tests.
+- Expand monitoring, restore drills, and retention verification.
+- Keep endpoint summaries aligned with the dedicated architecture documents.

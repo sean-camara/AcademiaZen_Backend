@@ -679,14 +679,14 @@ function isOwnedKey(key, uid) {
 const BILLING_PLANS = {
   premium: {
     weekly: {
-      amount: 14900,
+      amount: 4900,
       currency: 'PHP',
       label: 'Premium Weekly',
       description: 'AcademiaZen Premium (Weekly)',
       interval: 'weekly',
     },
     monthly: {
-      amount: 50000,
+      amount: 14900,
       currency: 'PHP',
       label: 'Premium Monthly',
       description: 'AcademiaZen Premium (Monthly)',
@@ -711,14 +711,21 @@ function isCouponCodeValid(code) {
   }
 }
 
-function getCheckoutUrls() {
+function getCheckoutUrls(req) {
   const base = process.env.PAYMONGO_SUCCESS_URL
     ? { success: process.env.PAYMONGO_SUCCESS_URL, cancel: process.env.PAYMONGO_CANCEL_URL }
     : null;
 
   if (base?.success && base?.cancel) return base;
 
-  const frontend = process.env.FRONTEND_URL || 'http://localhost:5173';
+  let clientOrigin = req?.headers?.origin || null;
+  if (!clientOrigin && req?.headers?.referer) {
+    try {
+      clientOrigin = new URL(req.headers.referer).origin;
+    } catch (_) {}
+  }
+
+  const frontend = clientOrigin || process.env.FRONTEND_URL || 'http://localhost:3000';
   return {
     success: `${frontend.replace(/\/+$/, '')}/?billing=success`,
     cancel: `${frontend.replace(/\/+$/, '')}/?billing=cancel`,
@@ -1264,7 +1271,7 @@ app.post('/api/billing/checkout', requireAuth, checkoutLimiter, async (req, res)
       });
     }
 
-    const { success, cancel } = getCheckoutUrls();
+    const { success, cancel } = getCheckoutUrls(req);
 
     const payload = {
       data: {
@@ -1355,7 +1362,7 @@ app.post('/api/billing/secret-checkout', requireAuth, checkoutLimiter, async (re
       });
     }
 
-    const { success, cancel } = getCheckoutUrls();
+    const { success, cancel } = getCheckoutUrls(req);
     const payload = {
       data: {
         attributes: {
@@ -1444,7 +1451,7 @@ app.post('/api/billing/extend', requireAuth, checkoutLimiter, async (req, res) =
       return res.status(400).json({ error: 'Invalid payment method' });
     }
 
-    const { success, cancel } = getCheckoutUrls();
+    const { success, cancel } = getCheckoutUrls(req);
 
     const intervalLabel = interval === 'weekly' ? '1 week' : '1 month';
 
