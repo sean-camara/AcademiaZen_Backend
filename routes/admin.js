@@ -622,4 +622,71 @@ router.post('/api/admin/maintenance', async (req, res) => {
   }
 });
 
+// Batch User Actions
+router.post('/api/admin/users/batch', async (req, res) => {
+  try {
+    const { uids, action, value } = req.body || {};
+    if (!Array.isArray(uids) || uids.length === 0) {
+      return res.status(400).json({ error: 'uids array is required' });
+    }
+
+    if (action === 'grant_plan') {
+      await User.updateMany(
+        { uid: { $in: uids } },
+        {
+          $set: {
+            'billing.plan': 'premium',
+            'billing.status': 'active',
+            'billing.interval': 'monthly',
+            'billing.currentPeriodEnd': new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          },
+        }
+      );
+    } else if (action === 'reset_ai') {
+      await User.updateMany(
+        { uid: { $in: uids } },
+        { $set: { 'aiUsage.dailyCount': 0, 'aiUsage.cooldownUntil': null } }
+      );
+    } else if (action === 'suspend') {
+      await User.updateMany({ uid: { $in: uids } }, { $set: { isSuspended: true } });
+    } else if (action === 'unsuspend') {
+      await User.updateMany({ uid: { $in: uids } }, { $set: { isSuspended: false } });
+    } else {
+      return res.status(400).json({ error: 'Invalid batch action' });
+    }
+
+    await logAdminAction(req, `BATCH_${action.toUpperCase()}`, null, { count: uids.length, uids });
+    res.json({ success: true, count: uids.length });
+  } catch (err) {
+    console.error('Failed to run batch action:', err);
+    res.status(500).json({ error: 'Failed to run batch action' });
+  }
+});
+
+// System Health Diagnostics with Collection Counts
+router.get('/api/admin/health/db-stats', async (req, res) => {
+  try {
+    const userCount = await User.countDocuments();
+    const focusCount = await FocusSession.countDocuments();
+    const aiLogCount = await AILog.countDocuments();
+    const annCount = await Announcement.countDocuments();
+    const fbCount = await Feedback.countDocuments();
+    const auditCount = await AdminAuditLog.countDocuments();
+
+    res.json({
+      collections: {
+        users: userCount,
+        focusSessions: focusCount,
+        aiLogs: aiLogCount,
+        announcements: annCount,
+        feedback: fbCount,
+        auditLogs: auditCount,
+      },
+    });
+  } catch (err) {
+    console.error('Failed db stats:', err);
+    res.status(500).json({ error: 'Failed db stats' });
+  }
+});
+
 module.exports = router;
