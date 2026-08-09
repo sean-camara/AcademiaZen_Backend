@@ -90,10 +90,55 @@ router.get('/api/admin/overview', async (req, res) => {
     ]);
     const totalFocusMinutes = Math.round((focusAgg[0]?.totalSeconds || 0) / 60);
 
-    // Calculate approximate MRR
-    const monthlySubs = await User.countDocuments({ 'billing.plan': 'premium', 'billing.interval': 'monthly', 'billing.status': 'active' });
-    const weeklySubs = await User.countDocuments({ 'billing.plan': 'premium', 'billing.interval': 'weekly', 'billing.status': 'active' });
-    const estimatedMRR = (monthlySubs * 149) + (weeklySubs * 196); // 49/wk ~ 196/mo
+    // Calculate 7-day activity telemetry
+    const now = new Date();
+    const dailyStats = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(now.getDate() - i);
+      const dateStr = d.toISOString().split('T')[0];
+      const dayName = d.toLocaleDateString('en-US', { weekday: 'short' });
+
+      const dayActiveUsers = await User.countDocuments({ 'state.updatedAt': { $regex: `^${dateStr}` } });
+      const dayAiRequests = await AILog.countDocuments({
+        createdAt: {
+          $gte: new Date(dateStr + 'T00:00:00Z'),
+          $lte: new Date(dateStr + 'T23:59:59Z'),
+        },
+      });
+
+      dailyStats.push({
+        date: dateStr,
+        dayName,
+        activeUsers: dayActiveUsers,
+        aiRequests: dayAiRequests,
+      });
+    }
+
+    // Recent activity feed
+    const recentUsers = await User.find()
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .select('email role billing createdAt')
+      .lean();
+
+    const recentActivity = recentUsers.map(u => ({
+      id: u._id.toString(),
+      type: 'signup',
+      title: `New student registered: ${u.email || 'Anonymous'}`,
+      timestamp: u.createdAt,
+      badge: u.billing?.plan === 'premium' ? 'Pro' : 'Free',
+    }));
+
+    // Top subjects
+    const subjectsPipeline = await User.aggregate([
+      { $unwind: '$state.subjects' },
+      { $group: { _id: '$state.subjects.name', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 4 },
+    ]);
+
+    const conversionRate = totalUsers > 0 ? Math.round((premiumUsers / totalUsers) * 1000) / 10 : 0;
 
     res.json({
       totalUsers,
@@ -105,6 +150,10 @@ router.get('/api/admin/overview', async (req, res) => {
       totalFocusMinutes,
       totalFocusSessions: focusAgg[0]?.count || 0,
       estimatedMRR,
+      conversionRate,
+      dailyStats,
+      recentActivity,
+      topSubjects: subjectsPipeline.map(s => ({ subject: s._id || 'General', count: s.count })),
     });
   } catch (err) {
     console.error('Admin overview failed:', err);
