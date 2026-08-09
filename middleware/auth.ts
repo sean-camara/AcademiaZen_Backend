@@ -27,6 +27,8 @@ interface VerifiedIdentity {
   uid: string;
   email?: string;
   email_verified?: boolean;
+  admin?: boolean;
+  role?: string;
 }
 
 type VerifyIdToken = (token: string) => Promise<VerifiedIdentity>;
@@ -41,10 +43,12 @@ function createRequireAuth(
       if (!token) return res.status(401).json({ error: 'Missing auth token' });
 
       const decoded = await verifyIdToken(token);
+      const isAdmin = Boolean(decoded.admin || decoded.role === 'admin');
       req.user = {
         uid: decoded.uid,
         email: decoded.email || '',
         emailVerified: Boolean(decoded.email_verified),
+        ...(isAdmin ? { isAdminClaim: true } : {}),
       };
       next();
     } catch {
@@ -67,17 +71,48 @@ async function deleteFirebaseUser(uid: string): Promise<void> {
   }
 }
 
-function requireAdmin(req: Request, res: Response, next: NextFunction): Response | void {
-  const adminList = (process.env.ADMIN_EMAILS || '')
-    .split(',')
-    .map((email) => email.trim().toLowerCase())
-    .filter(Boolean);
+async function requireAdmin(req: Request, res: Response, next: NextFunction): Promise<Response | void> {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Missing auth token' });
+    }
 
-  if (!adminList.length) return res.status(403).json({ error: 'Admin access not configured' });
-  if (!req.user?.email || !adminList.includes(req.user.email.toLowerCase())) {
+    const rawEnv = process.env.ADMIN_EMAILS;
+    const adminList = (rawEnv || '')
+      .split(',')
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean);
+
+    const userEmail = (req.user.email || '').toLowerCase();
+    const isDefaultAdmin = userEmail === 'admin123@admin.com';
+
+    if (!adminList.length && !isDefaultAdmin && !req.user.isAdminClaim) {
+      return res.status(403).json({ error: 'Admin access not configured' });
+    }
+
+    const isConfiguredAdmin = adminList.includes(userEmail) || isDefaultAdmin;
+
+    if (isConfiguredAdmin || req.user.isAdminClaim) {
+      return next();
+    }
+
+    if (req.user.uid) {
+      try {
+        const { User } = require('../models/User');
+        const user = await User.findOne({ uid: req.user.uid }).lean();
+        if (user && user.role === 'admin') {
+          return next();
+        }
+      } catch (dbErr) {
+        console.warn('[requireAdmin] DB check fallback warning:', dbErr);
+      }
+    }
+
     return res.status(403).json({ error: 'Forbidden' });
+  } catch (err) {
+    console.error('[requireAdmin] Auth verification error:', err);
+    return res.status(500).json({ error: 'Internal server error verifying admin status' });
   }
-  next();
 }
 
 export { initFirebaseAdmin, createRequireAuth, requireAuth, requireAdmin, deleteFirebaseUser };

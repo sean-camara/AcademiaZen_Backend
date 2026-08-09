@@ -4,6 +4,8 @@ declare global {
       uid: string;
       email: string;
       emailVerified: boolean;
+      isAdminClaim?: boolean;
+      role?: string;
     }
 
     interface Request {
