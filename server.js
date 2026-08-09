@@ -592,8 +592,8 @@ const PAYMONGO_WEBHOOK_TOLERANCE_SECONDS = Number(process.env.PAYMONGO_WEBHOOK_T
 
 const AI_ACCESS_MODE = (process.env.AI_ACCESS_MODE || 'free').toLowerCase();
 const ALLOW_FREE_AI = AI_ACCESS_MODE === 'free' || process.env.ALLOW_FREE_AI === 'true';
-const MAX_AI_PROMPT_CHARS = Number(process.env.MAX_AI_PROMPT_CHARS || 30000);
-const MAX_AI_PROMPT_CHARS_FREE = Number(process.env.MAX_AI_PROMPT_CHARS_FREE || 15000);
+const MAX_AI_PROMPT_CHARS = Number(process.env.MAX_AI_PROMPT_CHARS || 70000);
+const MAX_AI_PROMPT_CHARS_FREE = Number(process.env.MAX_AI_PROMPT_CHARS_FREE || 35000);
 const AI_BASE_URL = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
 const AI_MODEL_DEFAULT = process.env.AI_MODEL || 'deepseek/deepseek-v4-flash';
 const AI_MODEL_FAST = process.env.AI_MODEL_FAST || 'deepseek/deepseek-v4-flash';
@@ -2471,7 +2471,7 @@ app.post('/api/ai/chat', requireAuth, aiLimiter, aiUsageGuard, async (req, res) 
     const isDeep = mode === 'deep';
     const maxPromptChars = hasPremium ? MAX_AI_PROMPT_CHARS : MAX_AI_PROMPT_CHARS_FREE;
     if (prompt.length > maxPromptChars) {
-      return res.status(413).json({ error: 'Prompt is too long' });
+      return res.status(413).json({ error: 'The request message or attached context is too long. Please shorten your query or trim attached files.' });
     }
 
     logDetails.mode = isDeep ? 'deep' : 'fast';
@@ -2588,7 +2588,7 @@ app.post('/api/ai/chat/stream', requireAuth, aiLimiter, aiUsageGuard, async (req
     const maxPromptChars = hasPremium ? MAX_AI_PROMPT_CHARS : MAX_AI_PROMPT_CHARS_FREE;
     
     if (prompt.length > maxPromptChars) {
-      sendEvent('error', { message: 'Prompt is too long', code: 'PROMPT_TOO_LONG' });
+      sendEvent('error', { message: 'The request message or attached context is too long. Please shorten your query or trim attached files.', code: 'PROMPT_TOO_LONG' });
       res.end();
       return;
     }

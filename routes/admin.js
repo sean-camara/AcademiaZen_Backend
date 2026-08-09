@@ -94,9 +94,10 @@ router.get('/api/admin/overview', async (req, res) => {
     const todayStr = new Date().toISOString().split('T')[0];
     const monthStr = todayStr.substring(0, 7);
 
-    const activeUsersToday = await User.countDocuments({
-      'state.updatedAt': { $regex: `^${todayStr}` },
+    const activeUsersTodayUids = await AILog.distinct('uid', {
+      createdAt: { $gte: new Date(todayStr + 'T00:00:00Z') },
     });
+    const activeUsersToday = activeUsersTodayUids.length;
 
     const premiumUsers = await User.countDocuments({ 'billing.plan': 'premium', 'billing.status': 'active' });
     const freeUsers = Math.max(0, totalUsers - premiumUsers);
@@ -125,20 +126,18 @@ router.get('/api/admin/overview', async (req, res) => {
         const dateStr = d.toISOString().split('T')[0];
         const dayName = d.toLocaleDateString('en-US', { weekday: 'short' });
 
-        const [dayActiveUsers, dayAiRequests] = await Promise.all([
-          User.countDocuments({ 'state.updatedAt': { $regex: `^${dateStr}` } }),
-          AILog.countDocuments({
-            createdAt: {
-              $gte: new Date(dateStr + 'T00:00:00Z'),
-              $lte: new Date(dateStr + 'T23:59:59Z'),
-            },
-          }),
+        const dayStart = new Date(dateStr + 'T00:00:00Z');
+        const dayEnd = new Date(dateStr + 'T23:59:59Z');
+
+        const [dayActiveUserUids, dayAiRequests] = await Promise.all([
+          AILog.distinct('uid', { createdAt: { $gte: dayStart, $lte: dayEnd } }),
+          AILog.countDocuments({ createdAt: { $gte: dayStart, $lte: dayEnd } }),
         ]);
 
         return {
           date: dateStr,
           dayName,
-          activeUsers: dayActiveUsers,
+          activeUsers: dayActiveUserUids.length,
           aiRequests: dayAiRequests,
         };
       })
