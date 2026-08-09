@@ -9,6 +9,16 @@ const SystemSetting = require('../models/SystemSetting');
 const { AdminAuditLog } = require('../models/AdminAuditLog');
 const router = express.Router();
 
+function escapeRegex(str) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function sanitizeText(str) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/</g, '&lt;').replace(/>/g, '&gt;').trim();
+}
+
 async function logAdminAction(req, action, targetUid = null, details = {}) {
   try {
     await AdminAuditLog.create({
@@ -105,30 +115,34 @@ router.get('/api/admin/overview', async (req, res) => {
     ]);
     const totalFocusMinutes = Math.round((focusAgg[0]?.totalSeconds || 0) / 60);
 
-    // Calculate 7-day activity telemetry
+    // Calculate 7-day activity telemetry in parallel
     const now = new Date();
-    const dailyStats = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(now.getDate() - i);
-      const dateStr = d.toISOString().split('T')[0];
-      const dayName = d.toLocaleDateString('en-US', { weekday: 'short' });
+    const daysIndices = [6, 5, 4, 3, 2, 1, 0];
+    const dailyStats = await Promise.all(
+      daysIndices.map(async (i) => {
+        const d = new Date(now);
+        d.setDate(now.getDate() - i);
+        const dateStr = d.toISOString().split('T')[0];
+        const dayName = d.toLocaleDateString('en-US', { weekday: 'short' });
 
-      const dayActiveUsers = await User.countDocuments({ 'state.updatedAt': { $regex: `^${dateStr}` } });
-      const dayAiRequests = await AILog.countDocuments({
-        createdAt: {
-          $gte: new Date(dateStr + 'T00:00:00Z'),
-          $lte: new Date(dateStr + 'T23:59:59Z'),
-        },
-      });
+        const [dayActiveUsers, dayAiRequests] = await Promise.all([
+          User.countDocuments({ 'state.updatedAt': { $regex: `^${dateStr}` } }),
+          AILog.countDocuments({
+            createdAt: {
+              $gte: new Date(dateStr + 'T00:00:00Z'),
+              $lte: new Date(dateStr + 'T23:59:59Z'),
+            },
+          }),
+        ]);
 
-      dailyStats.push({
-        date: dateStr,
-        dayName,
-        activeUsers: dayActiveUsers,
-        aiRequests: dayAiRequests,
-      });
-    }
+        return {
+          date: dateStr,
+          dayName,
+          activeUsers: dayActiveUsers,
+          aiRequests: dayAiRequests,
+        };
+      })
+    );
 
     // Recent activity feed
     const recentUsers = await User.find()
@@ -187,11 +201,12 @@ router.get('/api/admin/users', async (req, res) => {
     const filter = {};
 
     if (q) {
+      const cleanQ = escapeRegex(String(q));
       filter.$or = [
-        { email: { $regex: String(q), $options: 'i' } },
-        { uid: { $regex: String(q), $options: 'i' } },
-        { 'state.profile.firstName': { $regex: String(q), $options: 'i' } },
-        { 'state.profile.lastName': { $regex: String(q), $options: 'i' } },
+        { email: { $regex: cleanQ, $options: 'i' } },
+        { uid: { $regex: cleanQ, $options: 'i' } },
+        { 'state.profile.firstName': { $regex: cleanQ, $options: 'i' } },
+        { 'state.profile.lastName': { $regex: cleanQ, $options: 'i' } },
       ];
     }
     if (role && ['user', 'admin'].includes(String(role))) {
@@ -239,25 +254,37 @@ router.get('/api/admin/users', async (req, res) => {
   }
 });
 
-// CSV Export for Users
+// Stream CSV Export for Users
 router.get('/api/admin/users/export', async (req, res) => {
   try {
-    const users = await User.find()
-      .sort({ createdAt: -1 })
-      .select('uid email role isSuspended billing aiUsage createdAt')
-      .lean();
-
-    let csv = 'UID,Email,Role,Plan,Status,Suspended,DailyAICount,TotalAIRequests,JoinedDate\n';
-    for (const u of users) {
-      csv += `"${u.uid}","${u.email || ''}","${u.role || 'user'}","${u.billing?.plan || 'free'}","${u.billing?.status || 'free'}","${u.isSuspended ? 'YES' : 'NO'}",${u.aiUsage?.dailyCount || 0},${u.aiUsage?.totalRequests || 0},"${new Date(u.createdAt).toISOString()}"\n`;
-    }
-
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', 'attachment; filename="academiazen_users.csv"');
-    res.send(csv);
+    res.write('UID,Email,Role,Plan,Status,Suspended,DailyAICount,TotalAIRequests,JoinedDate\n');
+
+    const cursor = User.find()
+      .sort({ createdAt: -1 })
+      .select('uid email role isSuspended billing aiUsage createdAt')
+      .cursor();
+
+    for (let u = await cursor.next(); u != null; u = await cursor.next()) {
+      const email = (u.email || '').replace(/"/g, '""');
+      const role = u.role || 'user';
+      const plan = u.billing?.plan || 'free';
+      const status = u.billing?.status || 'free';
+      const suspended = u.isSuspended ? 'YES' : 'NO';
+      const dailyCount = u.aiUsage?.dailyCount || 0;
+      const totalCount = u.aiUsage?.totalRequests || 0;
+      const date = u.createdAt ? new Date(u.createdAt).toISOString() : '';
+
+      res.write(`"${u.uid}","${email}","${role}","${plan}","${status}","${suspended}",${dailyCount},${totalCount},"${date}"\n`);
+    }
+
+    res.end();
   } catch (err) {
     console.error('Failed to export users CSV:', err);
-    res.status(500).json({ error: 'Failed to export users CSV' });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to export users CSV' });
+    }
   }
 });
 
@@ -266,6 +293,10 @@ router.post('/api/admin/users/:uid/role', async (req, res) => {
     const { role } = req.body || {};
     if (!['user', 'admin'].includes(role)) {
       return res.status(400).json({ error: 'Role must be user or admin' });
+    }
+
+    if (req.params.uid === req.user.uid && role !== 'admin') {
+      return res.status(400).json({ error: 'You cannot revoke your own administrator role' });
     }
 
     const user = await User.findOne({ uid: req.params.uid });
@@ -330,6 +361,10 @@ router.post('/api/admin/users/:uid/suspend', async (req, res) => {
     const { suspend } = req.body || {};
     if (typeof suspend !== 'boolean') {
       return res.status(400).json({ error: 'suspend parameter must be a boolean' });
+    }
+
+    if (req.params.uid === req.user.uid && suspend) {
+      return res.status(400).json({ error: 'You cannot suspend your own active administrator account' });
     }
 
     const user = await User.findOne({ uid: req.params.uid });
@@ -491,18 +526,20 @@ router.get('/api/admin/announcements', async (req, res) => {
 router.post('/api/admin/announcements', async (req, res) => {
   try {
     const { title, message, type = 'info' } = req.body || {};
-    if (!title || !message) {
+    const cleanTitle = sanitizeText(title);
+    const cleanMessage = sanitizeText(message);
+    if (!cleanTitle || !cleanMessage) {
       return res.status(400).json({ error: 'Title and message are required' });
     }
 
     const announcement = await Announcement.create({
-      title,
-      message,
+      title: cleanTitle,
+      message: cleanMessage,
       type,
       createdBy: req.user.email || req.user.uid,
     });
 
-    await logAdminAction(req, 'CREATE_ANNOUNCEMENT', null, { title, type });
+    await logAdminAction(req, 'CREATE_ANNOUNCEMENT', null, { title: cleanTitle, type });
 
     res.json({ success: true, announcement });
   } catch (err) {
@@ -537,7 +574,8 @@ router.get('/api/admin/feedback', async (req, res) => {
 router.post('/api/admin/feedback/:id/reply', async (req, res) => {
   try {
     const { reply, status = 'resolved' } = req.body || {};
-    if (!reply) {
+    const cleanReply = sanitizeText(reply);
+    if (!cleanReply) {
       return res.status(400).json({ error: 'Reply text is required' });
     }
 
@@ -546,13 +584,13 @@ router.post('/api/admin/feedback/:id/reply', async (req, res) => {
       return res.status(404).json({ error: 'Feedback ticket not found' });
     }
 
-    item.reply = reply;
+    item.reply = cleanReply;
     item.status = status;
     item.repliedAt = new Date();
     item.repliedBy = req.user.email || req.user.uid;
     await item.save();
 
-    await logAdminAction(req, 'REPLY_FEEDBACK', item.uid, { ticketId: item._id, reply });
+    await logAdminAction(req, 'REPLY_FEEDBACK', item.uid, { ticketId: item._id, reply: cleanReply });
 
     res.json({ success: true, feedback: item });
   } catch (err) {
@@ -630,9 +668,15 @@ router.post('/api/admin/users/batch', async (req, res) => {
       return res.status(400).json({ error: 'uids array is required' });
     }
 
+    // Exclude current logged-in admin UID from batch suspension
+    const targetUids = action === 'suspend' ? uids.filter((id) => id !== req.user.uid) : uids;
+    if (action === 'suspend' && targetUids.length === 0) {
+      return res.status(400).json({ error: 'You cannot suspend your own active administrator account' });
+    }
+
     if (action === 'grant_plan') {
       await User.updateMany(
-        { uid: { $in: uids } },
+        { uid: { $in: targetUids } },
         {
           $set: {
             'billing.plan': 'premium',
@@ -644,19 +688,19 @@ router.post('/api/admin/users/batch', async (req, res) => {
       );
     } else if (action === 'reset_ai') {
       await User.updateMany(
-        { uid: { $in: uids } },
+        { uid: { $in: targetUids } },
         { $set: { 'aiUsage.dailyCount': 0, 'aiUsage.cooldownUntil': null } }
       );
     } else if (action === 'suspend') {
-      await User.updateMany({ uid: { $in: uids } }, { $set: { isSuspended: true } });
+      await User.updateMany({ uid: { $in: targetUids } }, { $set: { isSuspended: true } });
     } else if (action === 'unsuspend') {
-      await User.updateMany({ uid: { $in: uids } }, { $set: { isSuspended: false } });
+      await User.updateMany({ uid: { $in: targetUids } }, { $set: { isSuspended: false } });
     } else {
       return res.status(400).json({ error: 'Invalid batch action' });
     }
 
-    await logAdminAction(req, `BATCH_${action.toUpperCase()}`, null, { count: uids.length, uids });
-    res.json({ success: true, count: uids.length });
+    await logAdminAction(req, `BATCH_${action.toUpperCase()}`, null, { count: targetUids.length, uids: targetUids });
+    res.json({ success: true, count: targetUids.length });
   } catch (err) {
     console.error('Failed to run batch action:', err);
     res.status(500).json({ error: 'Failed to run batch action' });
