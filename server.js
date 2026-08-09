@@ -43,6 +43,8 @@ const {
 const { acquireBillingEventLock, releaseBillingEventLock } = require('./services/billingEventLock');
 const { deleteAccount } = require('./services/accountDeletion');
 const { assertProductionEnvironment } = require('./services/envValidation');
+const adminRouter = require('./routes/admin');
+const { seedAdminUser } = require('./scripts/adminSeeder');
 const { createAILimits } = require('./services/aiLimits');
 const { verifyPaymongoWebhookSignature } = require('./services/paymongoSignature');
 
@@ -397,6 +399,8 @@ app.use(cors({
   credentials: true,
 }));
 
+app.use(adminRouter);
+
 // ----- Infrastructure initialization -----
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -415,6 +419,12 @@ async function initializeInfrastructure() {
     autoIndex: process.env.NODE_ENV !== 'production',
   });
   console.log(JSON.stringify({ level: 'info', event: 'mongodb_connected' }));
+
+  try {
+    await seedAdminUser();
+  } catch (err) {
+    console.error('[server] seedAdminUser warning:', err);
+  }
 
   webpush.setVapidDetails(
     process.env.VAPID_EMAIL || 'mailto:admin@academiazen.app',

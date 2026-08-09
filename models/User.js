@@ -198,6 +198,7 @@ const ZenStateSchema = new mongoose.Schema({
 const UserSchema = new mongoose.Schema({
   uid: { type: String, required: true, unique: true, index: true },
   email: { type: String, default: '' },
+  role: { type: String, enum: ['user', 'admin'], default: 'user', index: true },
   state: { type: ZenStateSchema, default: () => getDefaultState() },
   stateRevision: { type: Number, default: 0, min: 0 },
   notificationMeta: { type: NotificationMetaSchema, default: () => ({}) },
